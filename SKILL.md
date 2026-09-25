@@ -10,22 +10,23 @@ portable than the one before, so only move on when the earlier stages have
 been exhausted or clearly cannot help. Measure after every stage. Keep the
 reference implementation runnable so every change can be compared against it.
 
-| Stage | What | Typical gain | Cost / risk |
+| Stage | What | Pays off most when | Cost / risk |
 |---|---|---|---|
-| 0 | Baseline, sensitive correctness checks, measurement setup | enables the rest | low |
-| 1 | Classify: compute, memory, latency or cache bound | decides the path | low |
-| 2 | Data layout for vectorization, remove serialization | 1.3x to over 30x | medium |
-| 3 | Better algorithm: same result, less work or traffic | 2x to over 30x | medium to high |
-| 4 | Intrinsics (FMA, register blocking, transposes), streaming stores | 1.0x to 2.3x on top of stages 2 and 3 | high, ISA-specific |
+| 0 | Baseline, sensitive correctness checks, measurement setup | always (prerequisite) | low |
+| 1 | Classify: compute, memory, latency or cache bound | always (decides the path) | low |
+| 2 | Data layout for vectorization, remove serialization | code does not vectorize, uses strided/indirect access, or serializes on atomics | medium |
+| 3 | Better algorithm: same result, less work or traffic | the kernel does redundant work or makes redundant passes over memory | medium to high |
+| 4 | Intrinsics (FMA, register blocking, transposes), streaming stores | still compute bound after stages 2–3, or a store/gather inefficiency remains | high, ISA-specific |
 
-Rules of thumb from past use:
-- **The large wins come from stages 2 and 3.** Intrinsics on top of
-  well-vectorized compiler code gave 1.0x–1.2x for most kernels and at most
-  about 2.3x for register-heavy dense contractions.
+Rules of thumb:
+- **Expect the largest wins from stages 2 and 3.** Intrinsics on top of
+  code the compiler already vectorizes well usually add a modest gain. They
+  matter most for register-heavy dense contractions, where the compiler
+  spills or misses FMA opportunities.
 - **Memory-bound kernels already at DRAM peak gain nothing** from better
   vectorization. Only moving fewer bytes helps.
-- **Removing atomics or serialization** was the single largest win (over 30x)
-  when it applied.
+- **Removing atomics or serialization** can give order-of-magnitude gains
+  when it applies, because it restores full parallelism.
 
 ---
 
@@ -118,7 +119,7 @@ index, and has no cross-lane dependencies or serialization.
 3. **Batch many small independent solves** (small LU, Newton or quadratic
    solves) across lanes. Each lane solves a different system with identical
    control flow.
-4. **Compiler pitfalls (clang, observed):**
+4. **Compiler pitfalls to check for (seen with clang):**
    - Short lane loops (trip count = VL) get fully unrolled *before* the loop
      vectorizer runs, which leads to poor SLP code. Put
      `clang loop unroll(disable)` on the lane loop.
@@ -126,7 +127,7 @@ index, and has no cross-lane dependencies or serialization.
      (`clang loop unroll(full)`) so table indices fold to constants.
    - **No stack realignment for wide-vector spills** in OpenMP outlined
      regions. This causes misaligned spill slots that split cache lines, and
-     25–60% run-to-run differences between otherwise identical variants.
+     large timing differences between otherwise identical variants.
      Fix: move the batch body into a `noinline` function containing an
      `alignas(64)` local kept alive with `asm volatile("" :: "r"(ptr))`.
      This applies to plain C `omp simd` code with large `[..][VL]` arrays
@@ -144,7 +145,7 @@ usually beats everything else. Patterns that generalize:
 | Pattern | Recognize it by | Effect |
 |---|---|---|
 | **Loop fusion** | a chain of element-wise loops over the same index range, communicating through temporary arrays | one pass, temporaries stay in registers, traffic drops by the number of eliminated passes; keeping the operation order can make it bit-exact |
-| **Sum factorization** | tensor-product structure, e.g. $\sum_q \prod_d B_{i_d q_d} B_{j_d q_d}\, D_q$ evaluated naively | contract one dimension at a time; work goes from $O(p^{2d} q^d)$ to roughly $O(p^{d+1} q^d)$, observed about 17x fewer FLOPs |
+| **Sum factorization** | tensor-product structure, e.g. $\sum_q \prod_d B_{i_d q_d} B_{j_d q_d}\, D_q$ evaluated naively | contract one dimension at a time; work goes from $O(p^{2d} q^d)$ to roughly $O(p^{d+1} q^d)$; the saving grows with order and dimension |
 | **Metric / algebraic reformulation** | every basis function or vector is transformed by the same Jacobian at each quadrature point | transform the *metric* once per point ($G = J^T J/\det J$, $H = \det J\, J^{-1}J^{-T}$) and contract with the untransformed reference basis; exploit its sparsity; each entry becomes a few FMAs |
 | **Share work across outputs** | the same input is processed separately against several neighbouring targets (e.g. clipping one cell against each of its $2^d$ overlapping cells) | split once by the shared planes or boundaries so each piece goes to exactly one target; skip copies when a piece lies entirely on one side |
 | **Gather instead of scatter** | many-to-one accumulation with atomics | no atomics, full parallelism, vectorizable |
@@ -157,9 +158,8 @@ Rules:
 - **Keep the reference algorithm as the default** and add the new algorithm
   as a separately named variant or tuning, so baselines stay comparable.
 - **Write the new algorithm in plain C first** and measure it. This separates
-  the algorithmic gain from the intrinsics gain. Typically the algorithm
-  gives most of it (for example 1.9x from the algorithm, then 1.2x from
-  intrinsics).
+  the algorithmic gain from the intrinsics gain; the algorithm usually
+  accounts for most of it.
 - Nominal FLOP and byte models describe the *reference* algorithm.
   Reformulated variants will report GFLOP/s or GB/s *above hardware peak*.
   Report speedup instead, and use hardware counters for real efficiency (for
@@ -220,13 +220,13 @@ pollution.
 - Expose it as a separate `*_nt` variant, compiled only when the ISA
   supports it.
 
-Observed behaviour:
+Expected behaviour:
 
 | Situation | Effect |
 |---|---|
-| Output ~2x LLC, write-only, few input streams | **~1.3x faster**, reached measured DRAM peak |
-| Output large, but many input streams dominate traffic | ~1.0x |
-| Output fits in the LLC | **~4x slower**: every write is forced to DRAM |
+| Output well above LLC size, write-only, few input streams | faster; can approach measured DRAM peak |
+| Output large, but input streams dominate traffic | little or no change |
+| Output fits in the LLC | **much slower**: every write is forced out to DRAM |
 
 **Never use streaming stores when the output fits in the LLC, or when it is
 re-read soon afterwards.**
