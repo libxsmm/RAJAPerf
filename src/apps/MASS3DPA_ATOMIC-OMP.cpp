@@ -15,6 +15,7 @@
 #include "RAJA/RAJA.hpp"
 
 #include <iostream>
+#include <vector>
 
 namespace rajaperf {
 namespace apps {
@@ -26,6 +27,13 @@ void MASS3DPA_ATOMIC::runOpenMPVariant(VariantID vid) {
 
   const Index_type run_reps = getRunReps();
   MASS3DPA_ATOMIC_DATA_SETUP;
+  RAJA_UNUSED_VAR(NE);
+
+  const Index_type Nx = m_Nx;
+  const Index_type Ny = m_Ny;
+  const Index_type Nz = m_Nz;
+  const Index_type nby = (Ny + MPAT_ROW_BLOCK - 1) / MPAT_ROW_BLOCK;
+  const Index_type nbz = (Nz + MPAT_ROW_BLOCK - 1) / MPAT_ROW_BLOCK;
 
   switch (vid) {
 
@@ -36,10 +44,18 @@ void MASS3DPA_ATOMIC::runOpenMPVariant(VariantID vid) {
     for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
 
 RP_CALI_SUBKERNEL_BEGIN("MASS3DPA_ATOMIC_1");
-#pragma omp parallel for
-      for (Index_type e0 = 0; e0 < NE; e0 += FEM_VL) {
+#pragma omp parallel
+      for (Index_type c = 0; c < 4; ++c) {
+        const Index_type nblk = ((nby - (c & 1) + 1) / 2) * ((nbz - (c >> 1) + 1) / 2);
+#pragma omp for schedule(dynamic, 1)
+      for (Index_type b = 0; b < nblk; ++b) {
+      MPAT_COLOR_BLOCK(c, b, nby, nbz);
+      for (Index_type ez = bz * MPAT_ROW_BLOCK; ez < ez_end; ++ez) {
+      for (Index_type ey = by * MPAT_ROW_BLOCK; ey < ey_end; ++ey) {
+      const Index_type rend = Nx * (ey + Ny * ez) + Nx;
+      for (Index_type e0 = rend - Nx; e0 < rend; e0 += FEM_VL) {
 
-        MASS3DPA_ATOMIC_0_CPU_SIMD;
+        MASS3DPA_ATOMIC_0_CPU_SIMD(e0, rend);
 
         SHARED_LOOP_3D(dx, dy, dz, mpa_at::D1D, mpa_at::D1D, mpa_at::D1D) {
           MASS3DPA_ATOMIC_SIMD_1;
@@ -71,10 +87,14 @@ RP_CALI_SUBKERNEL_BEGIN("MASS3DPA_ATOMIC_1");
 
         SHARED_LOOP_3D(dx, dy, dz, mpa_at::D1D, mpa_at::D1D, mpa_at::D1D) {
           MASS3DPA_ATOMIC_SIMD_8;
-          MASS3DPA_ATOMIC_SIMD_9(RAJAPERF_ATOMIC_ADD_OMP);
+          MASS3DPA_ATOMIC_SIMD_9;
         }
 
-      } // element loop
+      } // element batch loop
+      } // ey
+      } // ez
+      } // block loop
+      } // color loop
 RP_CALI_SUBKERNEL_END("MASS3DPA_ATOMIC_1");
     }
     stopTimer();
@@ -107,10 +127,19 @@ RP_CALI_SUBKERNEL_END("MASS3DPA_ATOMIC_1");
         RAJA::LaunchParams(),
         [=] RAJA_HOST_DEVICE(RAJA::LaunchContext ctx) {
 
-          RAJA::loop<outer_x>(ctx, RAJA::RangeStrideSegment(0, NE, FEM_VL),
-            [&](Index_type e0) {
+         for (Index_type c = 0; c < 4; ++c) {
+          const Index_type nblk = ((nby - (c & 1) + 1) / 2) * ((nbz - (c >> 1) + 1) / 2);
 
-            MASS3DPA_ATOMIC_0_CPU_SIMD;
+          RAJA::loop<outer_x>(ctx, RAJA::RangeSegment(0, nblk),
+            [&](Index_type b) {
+
+           MPAT_COLOR_BLOCK(c, b, nby, nbz);
+           for (Index_type ez = bz * MPAT_ROW_BLOCK; ez < ez_end; ++ez) {
+           for (Index_type ey = by * MPAT_ROW_BLOCK; ey < ey_end; ++ey) {
+           const Index_type rend = Nx * (ey + Ny * ez) + Nx;
+           for (Index_type e0 = rend - Nx; e0 < rend; e0 += FEM_VL) {
+
+            MASS3DPA_ATOMIC_0_CPU_SIMD(e0, rend);
 
             RAJA::loop<inner_z>(ctx, RAJA::RangeSegment(0, mpa_at::D1D),
               [&](Index_type dz) {
@@ -224,7 +253,7 @@ RP_CALI_SUBKERNEL_END("MASS3DPA_ATOMIC_1");
                     RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, mpa_at::D1D),
                       [&](Index_type dx) {
                       MASS3DPA_ATOMIC_SIMD_8;
-                      MASS3DPA_ATOMIC_SIMD_9(RAJAPERF_ATOMIC_ADD_RAJA_OMP);
+                      MASS3DPA_ATOMIC_SIMD_9;
                       } // lambda (dx)
                     ); // RAJA::loop<inner_x>
                   } // lambda (dy)
@@ -232,8 +261,12 @@ RP_CALI_SUBKERNEL_END("MASS3DPA_ATOMIC_1");
               } // lambda (dz)
             ); // RAJA::loop<inner_z>
 
-            }  // lambda (e)
-          );  // RAJA::loop<outer_x>
+           } // e0
+           } // ey
+           } // ez
+            }  // lambda (b)
+          );  // RAJA::loop<outer_x>, implicit barrier between colors
+         }  // color loop
 
         }  // outer lambda (ctx)
       );  // // RAJA::launch

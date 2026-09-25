@@ -22,7 +22,9 @@
 #   NTHREADS     OpenMP threads (default: 64, pinned to cores 0..NTHREADS-1)
 #   NREP         interleaved main/vec repetitions (default: 3)
 #   NPASSES      RAJAPerf --npasses per run       (default: 3)
-#   FORCE_BUILD  rebuild even if binaries exist   (default: 0)
+#   FORCE_BUILD  rebuild even if binaries exist: 1, main or vec (default: 0)
+#   KERNELS      space-separated subset of the kernels below (default: all 10)
+#   RESULTS      results directory                (default: $WORK/results)
 #
 set -euo pipefail
 
@@ -41,10 +43,12 @@ NTHREADS="${NTHREADS:-64}"
 NREP="${NREP:-3}"
 NPASSES="${NPASSES:-3}"
 FORCE_BUILD="${FORCE_BUILD:-0}"
-RESULTS="$WORK/results"
+RESULTS="${RESULTS:-$WORK/results}"
 
-KERNELS=(EDGE3D DIFFUSION3DPA ENERGY FEMSWEEP INTSC_HEXRECT MASS3DEA
-         MASS3DPA_ATOMIC MASSVEC3DPA NODAL_ACCUMULATION_3D VOL3D)
+ALL_KERNELS="EDGE3D DIFFUSION3DPA ENERGY FEMSWEEP INTSC_HEXRECT MASS3DEA
+             MASS3DPA_ATOMIC MASSVEC3DPA NODAL_ACCUMULATION_3D VOL3D"
+# a separate array name keeps the exported KERNELS string visible to 'salloc ... run'
+read -r -a KERNEL_LIST <<< "$(echo ${KERNELS:-$ALL_KERNELS})"
 
 # Problem sizes: every OpenMP run takes >= ~0.5 ms per rep on 64 cores, and the
 # streaming FEM/hydro kernels (DIFFUSION3DPA, MASSVEC3DPA, MASS3DPA_ATOMIC,
@@ -63,7 +67,7 @@ declare -A SIZE=(
 )
 
 # Kernels whose OpenMP variants differ between MAIN_REF and VEC_REF.
-CHANGED="EDGE3D DIFFUSION3DPA FEMSWEEP MASS3DEA MASS3DPA_ATOMIC MASSVEC3DPA"
+CHANGED="EDGE3D DIFFUSION3DPA FEMSWEEP MASS3DEA MASS3DPA_ATOMIC MASSVEC3DPA NODAL_ACCUMULATION_3D"
 
 PERF_VARIANTS="Base_OpenMP Lambda_OpenMP RAJA_OpenMP"
 CHECK_VARIANTS="Base_Seq $PERF_VARIANTS"
@@ -79,7 +83,7 @@ make_src() {
 build_one() {
   local name=$1 src=$2
   local bdir="$WORK/build-$name"
-  if [[ "$FORCE_BUILD" != "1" && -x "$bdir/bin/raja-perf.exe" ]]; then
+  if [[ "$FORCE_BUILD" != "1" && "$FORCE_BUILD" != "$name" && -x "$bdir/bin/raja-perf.exe" ]]; then
     echo "[$name] using existing $bdir/bin/raja-perf.exe"
     return
   fi
@@ -103,8 +107,8 @@ do_build() {
   build_one main "$MAIN_SRC"
   build_one vec "$VEC_SRC"
   {
-    echo "main: $MAIN_SRC $(git -C "$MAIN_SRC" rev-parse HEAD)"
-    echo "vec:  $VEC_SRC $(git -C "$VEC_SRC" rev-parse HEAD)"
+    echo "main: $MAIN_SRC $(git -C "$MAIN_SRC" describe --always --dirty --abbrev=12)"
+    echo "vec:  $VEC_SRC $(git -C "$VEC_SRC" describe --always --dirty --abbrev=12)"
     echo "CXX:  $("$CXX" --version | head -1)"
     echo "CXX_FLAGS: $CXX_FLAGS"
   } > "$WORK/build-info.txt"
@@ -125,7 +129,7 @@ do_run() {
 
   # Correctness: one rep per kernel with Base_Seq as checksum reference.
   for b in main vec; do
-    for k in "${KERNELS[@]}"; do
+    for k in "${KERNEL_LIST[@]}"; do
       local out="$RESULTS/check/$b/$k"
       mkdir -p "$out"
       srun "$WORK/build-$b/bin/raja-perf.exe" --kernels "$k" --variants $CHECK_VARIANTS \
@@ -140,7 +144,7 @@ do_run() {
   # Performance: main and vec interleaved to spread node noise over both.
   for rep in $(seq 1 "$NREP"); do
     for b in main vec; do
-      for k in "${KERNELS[@]}"; do
+      for k in "${KERNEL_LIST[@]}"; do
         local out="$RESULTS/perf/$b/$k/run$rep"
         mkdir -p "$out"
         local st=0
@@ -153,7 +157,7 @@ do_run() {
 }
 
 do_report() {
-  RESULTS="$RESULTS" CHANGED="$CHANGED" KERNELS="${KERNELS[*]}" \
+  RESULTS="$RESULTS" CHANGED="$CHANGED" KERNELS="${KERNEL_LIST[*]}" \
   NTHREADS="$NTHREADS" NREP="$NREP" NPASSES="$NPASSES" python3 - << 'EOF'
 import csv, glob, os, re, statistics
 

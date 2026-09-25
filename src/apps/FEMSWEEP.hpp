@@ -86,6 +86,8 @@
 #ifndef RAJAPerf_Apps_FEMSWEEP_HPP
 #define RAJAPerf_Apps_FEMSWEEP_HPP
 
+#include <atomic>
+
 #include "common/KernelBase.hpp"
 
 #include "RAJA/RAJA.hpp"
@@ -332,53 +334,39 @@ RAJA_INLINE void SolveLinearSystemNxN_simd(Real_const_ptr A,
                                            const Real_type (&b)[N][FEM_VL],
                                            Real_type (&x)[N][FEM_VL])
 {
-  Real_type tempA[N][N][FEM_VL];
-  Real_type L[N][N][FEM_VL];
-  Real_type U[N][N][FEM_VL];
+  // In-place Crout LU: LU[i][j] holds L for j <= i and unit-diagonal U for j > i.
+  // Same operation order as SolveLinearSystemNxN minus its products with
+  // known-zero entries; one reciprocal per diagonal replaces repeated divides.
+  Real_type LU[N][N][FEM_VL];
+  Real_type rinv[N][FEM_VL];
   Real_type D[N][FEM_VL];
   Real_type sum[FEM_VL];
 
-  // tempA = A + s * M0
-  // set L to 0, U to identity
+  // LU = A + s * M0
   for ( Index_type ii = 0; ii < N; ++ii )
   {
     for ( Index_type jj = 0; jj < N; ++jj )
     {
       const Real_type Aij = A[ii * N + jj];
       const Real_type Mij = M[ii * N + jj];
-      const Real_type Uij = ( ii == jj ) ? 1.0 : 0.0;
-      CPU_FOREACH_LANE(l) {
-        tempA[ii][jj][l] = Aij + s[l] * Mij;
-        L[ii][jj][l] = 0.0;
-        U[ii][jj][l] = Uij;
-      }
+      CPU_FOREACH_LANE(l) { LU[ii][jj][l] = Aij + s[l] * Mij; }
     }
   }
 
-  // set first column of L, and first row of U
   for ( Index_type ii = 0; ii < N; ++ii )
-  {
-    CPU_FOREACH_LANE(l) { L[ii][0][l] = tempA[ii][0][l]; }
-  }
-
-  for ( Index_type ii = 1; ii < N; ++ii )
-  {
-    CPU_FOREACH_LANE(l) { U[0][ii][l] = tempA[0][ii][l]/tempA[0][0][l]; }
-  }
-
-  // form L & U
-  for ( Index_type ii = 1; ii < N; ++ii )
   {
     // L column formation
     for ( Index_type jj = ii; jj < N; ++jj )
     {
       CPU_FOREACH_LANE(l) { sum[l] = 0.0; }
-      for ( Index_type kk = 0; kk < jj; ++kk )
+      for ( Index_type kk = 0; kk < ii; ++kk )
       {
-        CPU_FOREACH_LANE(l) { sum[l] += L[jj][kk][l] * U[kk][ii][l]; }
+        CPU_FOREACH_LANE(l) { sum[l] += LU[jj][kk][l] * LU[kk][ii][l]; }
       }
-      CPU_FOREACH_LANE(l) { L[jj][ii][l] = tempA[jj][ii][l] - sum[l]; }
+      CPU_FOREACH_LANE(l) { LU[jj][ii][l] = LU[jj][ii][l] - sum[l]; }
     }
+
+    CPU_FOREACH_LANE(l) { rinv[ii][l] = 1.0 / LU[ii][ii][l]; }
 
     // U row formation
     for ( Index_type jj = ii+1; jj < N; ++jj )
@@ -386,22 +374,21 @@ RAJA_INLINE void SolveLinearSystemNxN_simd(Real_const_ptr A,
       CPU_FOREACH_LANE(l) { sum[l] = 0.0; }
       for ( Index_type kk = 0; kk < ii; ++kk )
       {
-        CPU_FOREACH_LANE(l) { sum[l] += L[ii][kk][l] * U[kk][jj][l]; }
+        CPU_FOREACH_LANE(l) { sum[l] += LU[ii][kk][l] * LU[kk][jj][l]; }
       }
-      CPU_FOREACH_LANE(l) { U[ii][jj][l] = (tempA[ii][jj][l] - sum[l])/L[ii][ii][l]; }
+      CPU_FOREACH_LANE(l) { LU[ii][jj][l] = (LU[ii][jj][l] - sum[l]) * rinv[ii][l]; }
     }
   }
 
   // forward substitution
-  CPU_FOREACH_LANE(l) { D[0][l] = b[0][l]/L[0][0][l]; }
-  for ( Index_type ii = 1; ii < N; ++ii )
+  for ( Index_type ii = 0; ii < N; ++ii )
   {
     CPU_FOREACH_LANE(l) { sum[l] = 0.0; }
     for ( Index_type jj = 0; jj < ii; ++jj )
     {
-      CPU_FOREACH_LANE(l) { sum[l] += L[ii][jj][l] * D[jj][l]; }
+      CPU_FOREACH_LANE(l) { sum[l] += LU[ii][jj][l] * D[jj][l]; }
     }
-    CPU_FOREACH_LANE(l) { D[ii][l] = (b[ii][l] - sum[l])/L[ii][ii][l]; }
+    CPU_FOREACH_LANE(l) { D[ii][l] = (b[ii][l] - sum[l]) * rinv[ii][l]; }
   }
 
   // backward substitution
@@ -411,11 +398,78 @@ RAJA_INLINE void SolveLinearSystemNxN_simd(Real_const_ptr A,
     CPU_FOREACH_LANE(l) { sum[l] = 0.0; }
     for ( Index_type jj = ii+1; jj < N; ++jj )
     {
-      CPU_FOREACH_LANE(l) { sum[l] += U[ii][jj][l] * x[jj][l]; }
+      CPU_FOREACH_LANE(l) { sum[l] += LU[ii][jj][l] * x[jj][l]; }
     }
     CPU_FOREACH_LANE(l) { x[ii][l] = D[ii][l] - sum[l]; }
   }
 }
+
+// Spin barrier for a team of concurrently running threads.
+struct alignas(64) FemsweepTeamBarrier
+{
+  std::atomic<int> count{0};
+  std::atomic<int> sense{0};
+
+  void wait(int nthreads, int& local_sense)
+  {
+    local_sense ^= 1;
+    if (count.fetch_add(1, std::memory_order_acq_rel) == nthreads - 1) {
+      count.store(0, std::memory_order_relaxed);
+      sense.store(local_sense, std::memory_order_release);
+    } else {
+      while (sense.load(std::memory_order_acquire) != local_sense) {
+#if defined(__x86_64__)
+        __builtin_ia32_pause();
+#endif
+      }
+    }
+  }
+};
+
+// Team size (1,2,4,8) minimizing waves/team_size for ntasks sweeps on nthreads.
+inline void femsweep_team_shape(Index_type ntasks, int nthreads,
+                                int& team_size, int& nteams)
+{
+  double best = 0.0;
+  team_size = 1;
+  for (int ts = 1; ts <= 8 && ts <= nthreads; ts *= 2) {
+    const Index_type nt = nthreads / ts;
+    const double cost = static_cast<double>((ntasks + nt - 1) / nt) / ts;
+    if (ts == 1 || cost < best - 1e-12) {
+      best = cost;
+      team_size = ts;
+    }
+  }
+  nteams = nthreads / team_size;
+}
+
+//
+// Sweeps of all (angle, group batch) tasks by thread 'slot': teams of
+// team_size threads share one sweep, splitting each hyperplane's elements
+// and synchronizing once per hyperplane.
+//
+#define FEMSWEEP_TEAM_SWEEP(slot) \
+  { \
+    const int team = (slot) / team_size; \
+    const int rank = (slot) % team_size; \
+    if (team < nteams) { \
+      int local_sense = 0; \
+      for (Index_type t = team; t < na * nbg; t += nteams) { \
+        const Index_type a = t / nbg; \
+        const Index_type g0 = (t % nbg) * FEM_VL; \
+        FEMSWEEP_KERNEL_SETUP_SIMD; \
+        Index_type nehp_pos = 0; \
+        for (Index_type hp = 0; hp < nhp; ++hp) { \
+          const Index_type nehp = phpaa_r[ohp + hp]; \
+          for (Index_type k = rank; k < nehp; k += team_size) { \
+            FEMSWEEP_KERNEL_HYPERPLANE_ELEMENT_SIMD; \
+          } \
+          if (team_size > 1) { team_barriers[team].wait(team_size, local_sense); } \
+          nehp_pos += nehp; \
+        } \
+      } \
+    } \
+  }
 
 
 class RunParams;

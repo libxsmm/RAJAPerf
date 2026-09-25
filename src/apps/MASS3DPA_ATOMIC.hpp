@@ -256,15 +256,19 @@ constexpr RAJA::Index_type Q1D = 4;
   atomicAdd(Y[thread_dofs[j]], u); // atomic add
 
 //
-// CPU SoA variant: batch of FEM_VL elements starting at e0, element innermost.
-// Stage 2 (basis load) is element independent and reused as is.
+// CPU SoA variant: batch of FEM_VL consecutive elements [e0, eend) of one
+// x-row. Rows are grouped in MPAT_ROW_BLOCK^2 blocks (y,z) that are 4-colored
+// like a checkerboard, so threads working on one color share no DOFs.
+// Stage 2 (basis load) is reused as is.
 //
-#define MASS3DPA_ATOMIC_0_CPU_SIMD                                             \
+constexpr RAJA::Index_type MPAT_ROW_BLOCK = 4;
+
+#define MASS3DPA_ATOMIC_0_CPU_SIMD(e0, eend)                                   \
   constexpr Index_type MQ1 = mpa_at::Q1D;                                      \
   constexpr Index_type MD1 = mpa_at::D1D;                                      \
   constexpr Index_type MDQ = (MQ1 > MD1) ? MQ1 : MD1;                          \
   constexpr Index_type VL = FEM_VL;                                            \
-  FEM_BATCH_SETUP(e0, NE);                                                     \
+  FEM_BATCH_SETUP(e0, eend);                                                   \
   Real_type sm_B[MQ1][MD1];                                                    \
   Real_type sm_Bt[MD1][MQ1];                                                   \
   Real_type sm0[MDQ * MDQ * MDQ][VL];                                          \
@@ -342,11 +346,24 @@ constexpr RAJA::Index_type Q1D = 4;
   }                                                                            \
   const Index_type j = dx + mpa_at::D1D * (dy + dz * mpa_at::D1D);
 
-// scatter SoA -> AoS; lanes may share DOFs, so one atomic per valid lane
-#define MASS3DPA_ATOMIC_SIMD_9(atomicAdd)                                      \
-  for (Index_type l = 0; l < nel; ++l) {                                       \
-    atomicAdd(Y[thread_dofs[j][l]], r_u[l]);                                   \
+// scatter SoA -> AoS without atomics: neighboring lanes (x-adjacent elements)
+// share DOFs, so even and odd lanes are scattered in two conflict-free passes
+#define MASS3DPA_ATOMIC_SIMD_9                                                 \
+  for (Index_type parity = 0; parity < 2; ++parity) {                          \
+    CPU_FOREACH_LANE(l) {                                                      \
+      if (l < nel && (l & 1) == parity) {                                      \
+        Y[thread_dofs[j][l]] += r_u[l];                                        \
+      }                                                                        \
+    }                                                                          \
   }
+
+// Row block (by, bz) of the b-th block with color c = (by%2) + 2*(bz%2).
+#define MPAT_COLOR_BLOCK(c, b, nby, nbz)                                       \
+  const Index_type nby_c = ((nby) - ((c) & 1) + 1) / 2;                        \
+  const Index_type by = 2 * ((b) % nby_c) + ((c) & 1);                         \
+  const Index_type bz = 2 * ((b) / nby_c) + ((c) >> 1);                        \
+  const Index_type ey_end = RAJA_MIN((by + 1) * MPAT_ROW_BLOCK, Ny);           \
+  const Index_type ez_end = RAJA_MIN((bz + 1) * MPAT_ROW_BLOCK, Nz);
 
 namespace rajaperf {
 class RunParams;

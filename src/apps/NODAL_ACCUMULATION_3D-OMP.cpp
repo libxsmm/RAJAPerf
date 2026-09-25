@@ -26,10 +26,10 @@ void NODAL_ACCUMULATION_3D::runOpenMPVariant(VariantID vid)
 #if defined(RAJA_ENABLE_OPENMP) && defined(RUN_OPENMP)
 
   const Index_type run_reps = getRunReps();
-  const Index_type ibegin = 0;
-  const Index_type iend = m_domain->n_real_zones;
 
-  NODAL_ACCUMULATION_3D_DATA_SETUP;
+  Real_ptr x = m_x;
+  Real_ptr vol = m_vol;
+  NODAL_ACCUMULATION_3D_GATHER_SETUP;
 
 
   switch ( vid ) {
@@ -42,9 +42,8 @@ void NODAL_ACCUMULATION_3D::runOpenMPVariant(VariantID vid)
 
         RP_CALI_SUBKERNEL_BEGIN("NODAL_ACCUMULATION_3D_1");
         #pragma omp parallel for
-        for (Index_type ii = ibegin ; ii < iend ; ++ii ) {
-          NODAL_ACCUMULATION_3D_BODY_INDEX;
-          NODAL_ACCUMULATION_3D_BODY(RAJAPERF_ATOMIC_ADD_OMP);
+        for (Index_type r = 0 ; r < nrows ; ++r ) {
+          NODAL_ACCUMULATION_3D_GATHER_ROW(r);
         }
         RP_CALI_SUBKERNEL_END("NODAL_ACCUMULATION_3D_1");
 
@@ -56,9 +55,8 @@ void NODAL_ACCUMULATION_3D::runOpenMPVariant(VariantID vid)
 
     case Lambda_OpenMP : {
 
-      auto nodal_accumulation_3d_lam = [=](Index_type ii) {
-            NODAL_ACCUMULATION_3D_BODY_INDEX;
-            NODAL_ACCUMULATION_3D_BODY(RAJAPERF_ATOMIC_ADD_OMP);
+      auto nodal_accumulation_3d_lam = [=](Index_type r) {
+            NODAL_ACCUMULATION_3D_GATHER_ROW(r);
           };
 
       startTimer();
@@ -67,8 +65,8 @@ void NODAL_ACCUMULATION_3D::runOpenMPVariant(VariantID vid)
 
         RP_CALI_SUBKERNEL_BEGIN("NODAL_ACCUMULATION_3D_1");
         #pragma omp parallel for
-        for (Index_type ii = ibegin ; ii < iend ; ++ii ) {
-          nodal_accumulation_3d_lam(ii);
+        for (Index_type r = 0 ; r < nrows ; ++r ) {
+          nodal_accumulation_3d_lam(r);
         }
         RP_CALI_SUBKERNEL_END("NODAL_ACCUMULATION_3D_1");
 
@@ -82,11 +80,8 @@ void NODAL_ACCUMULATION_3D::runOpenMPVariant(VariantID vid)
 
       auto res{getHostResource()};
 
-      RAJA::TypedListSegment<Index_type> zones(real_zones, iend,
-                                               res, RAJA::Unowned);
-
-      auto nodal_accumulation_3d_lam = [=](Index_type i) {
-                                         NODAL_ACCUMULATION_3D_BODY(RAJAPERF_ATOMIC_ADD_RAJA_OMP);
+      auto nodal_accumulation_3d_lam = [=](Index_type r) {
+                                         NODAL_ACCUMULATION_3D_GATHER_ROW(r);
                                        };
 
       startTimer();
@@ -95,7 +90,7 @@ void NODAL_ACCUMULATION_3D::runOpenMPVariant(VariantID vid)
 
         RP_CALI_SUBKERNEL_BEGIN("NODAL_ACCUMULATION_3D_1");
         RAJA::forall<RAJA::omp_parallel_for_exec>( res,
-          zones, nodal_accumulation_3d_lam);
+          RAJA::RangeSegment(0, nrows), nodal_accumulation_3d_lam);
         RP_CALI_SUBKERNEL_END("NODAL_ACCUMULATION_3D_1");
 
       }
