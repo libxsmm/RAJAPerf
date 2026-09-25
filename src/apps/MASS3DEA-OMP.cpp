@@ -20,12 +20,76 @@ namespace rajaperf {
 namespace apps {
 
 
+// tune_idx 0: reference algorithm; 1: sum factorization; 2: sum factorization
+// with streaming stores of M
+template <size_t tune_idx>
 void MASS3DEA::runOpenMPVariant(VariantID vid) {
 
 #if defined(RAJA_ENABLE_OPENMP) && defined(RUN_OPENMP)
 
   const Index_type run_reps = getRunReps();
   MASS3DEA_DATA_SETUP;
+
+  if constexpr (tune_idx > 0) {
+
+  constexpr bool stream = (tune_idx == 2);
+  const bool nt_ok = fem_simd::is_aligned64(M);
+  const Index_type nbe = (NE + FEM_VL - 1) / FEM_VL;
+
+  switch (vid) {
+
+  case Base_OpenMP: {
+
+    startTimer();
+    // Loop counter increment uses macro to quiet C++20 compiler warning
+    for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
+
+      #pragma omp parallel
+      {
+        #pragma omp for collapse(2) nowait
+        for (Index_type b = 0; b < nbe; ++b) {
+          for (Index_type j3 = 0; j3 < mea::D1D; ++j3) {
+            mass3dea_sumfact_block<stream>(B, D, M, NE, b * FEM_VL, j3, nt_ok);
+          }
+        }
+        if (stream) { fem_simd::stream_fence(); }
+      }
+
+    }
+    stopTimer();
+
+    break;
+  }
+
+  case RAJA_OpenMP: {
+
+    auto res{getHostResource()};
+
+    startTimer();
+    // Loop counter increment uses macro to quiet C++20 compiler warning
+    for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
+
+      RAJA::region<RAJA::omp_parallel_region>( [=]() {
+        RAJA::forall< RAJA::omp_for_nowait_static_exec< > >( res,
+          RAJA::RangeSegment(0, nbe * mea::D1D), [=](Index_type ej) {
+            mass3dea_sumfact_block<stream>(B, D, M, NE, (ej / mea::D1D) * FEM_VL,
+                                           ej % mea::D1D, nt_ok);
+          });
+        if (stream) { fem_simd::stream_fence(); }
+      });
+
+    }
+    stopTimer();
+
+    break;
+  }
+
+  default:
+    getCout() << "\n MASS3DEA : Unknown OpenMP variant id = " << vid
+              << std::endl;
+  }
+
+  } else {
 
   switch (vid) {
 
@@ -61,7 +125,7 @@ RP_CALI_SUBKERNEL_BEGIN("MASS3DEA_1");
           }
         }
 
-        MASS3DEA_SIMD_4
+        MASS3DEA_CPU_SIMD_4
 
       }
       }
@@ -146,7 +210,7 @@ RP_CALI_SUBKERNEL_END("MASS3DEA_1");
 
               ctx.teamSync();
 
-              MASS3DEA_SIMD_4
+              MASS3DEA_CPU_SIMD_4
 
             } // lambda (ej)
           );    // RAJA::loop<outer_x>
@@ -167,12 +231,24 @@ RP_CALI_SUBKERNEL_END("MASS3DEA_1");
               << std::endl;
   }
 
+  }
+
 #else
   RAJA_UNUSED_VAR(vid);
 #endif
 }
 
-RAJAPERF_DEFAULT_TUNING_DEFINE_BOILERPLATE(MASS3DEA, OpenMP, Base_OpenMP, RAJA_OpenMP)
+void MASS3DEA::defineOpenMPVariantTunings()
+{
+  for (VariantID vid : {Base_OpenMP, RAJA_OpenMP}) {
+    addVariantTuning<&MASS3DEA::runOpenMPVariant<0>>(vid, getDefaultTuningName());
+    // same result, far fewer FLOPs than setFLOPsPerRep() counts
+    addVariantTuning<&MASS3DEA::runOpenMPVariant<1>>(vid, "sumfact");
+#if defined(RAJAPERF_FEM_AVX512)
+    addVariantTuning<&MASS3DEA::runOpenMPVariant<2>>(vid, "sumfact_nt");
+#endif
+  }
+}
 
 } // end namespace apps
 } // end namespace rajaperf

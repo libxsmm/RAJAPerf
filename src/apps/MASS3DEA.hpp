@@ -84,6 +84,7 @@
   Index_type NE = m_NE;
 
 #include "FEM_MACROS.hpp"
+#include "FEM_SIMD.hpp"
 #include "common/KernelBase.hpp"
 
 #include "RAJA/RAJA.hpp"
@@ -196,6 +197,231 @@ constexpr RAJA::Index_type Q1D = 5;
     }                                                                          \
   }
 
+#if defined(RAJAPERF_FEM_AVX512)
+//
+// AVX-512 version of MASS3DEA_SIMD_4 for one (batch, j1, j2, j3) block:
+//   M[i][e] = sum_k (b1[k1][i1] b2[k2][i2]) (b3[k3][i3] D[k][e]),
+//   bn[k][i] = B[k][i] B[k][jn].
+// t = b3 D is formed once per (i3, k); the i1 x (2 i2) = 8 register
+// accumulators each take one FMA with a broadcast coefficient, and
+// correspond to one contiguous 8-entry chunk of M, written back with an 8x8
+// transpose.
+//
+RAJAPERF_FEM_NOINLINE void mass3dea_block_avx512(
+    const rajaperf::Real_type (&s_B)[mea::Q1D][mea::D1D],
+    const rajaperf::Real_type (&s_D)[mea::Q1D][mea::Q1D][mea::Q1D][FEM_VL],
+    const rajaperf::Index_type j1, const rajaperf::Index_type j2,
+    const rajaperf::Index_type j3, rajaperf::Real_ptr M,
+    const rajaperf::Index_type e0, const rajaperf::Index_type nel)
+{
+  using namespace rajaperf::fem_simd;
+  using rajaperf::Real_type;
+  using rajaperf::Index_type;
+  constexpr Index_type D1 = mea::D1D;
+  constexpr Index_type Q1 = mea::Q1D;
+  static_assert(D1 == 4, "i-chunk mapping assumes D1D == 4");
+
+  // c12[ip][k1][k2][i1 + 4*ii] = b1[k1][i1] * b2[k2][2*ip + ii]
+  alignas(64) Real_type c12[2][Q1][Q1][8];
+  for (Index_type k1 = 0; k1 < Q1; ++k1) {
+    for (Index_type k2 = 0; k2 < Q1; ++k2) {
+      for (Index_type i2 = 0; i2 < D1; ++i2) {
+        const Real_type b2 = s_B[k2][i2] * s_B[k2][j2];
+        for (Index_type i1 = 0; i1 < D1; ++i1) {
+          c12[i2 / 2][k1][k2][i1 + D1 * (i2 % 2)] =
+              s_B[k1][i1] * s_B[k1][j1] * b2;
+        }
+      }
+    }
+  }
+
+  Real_type *row[8];
+  for (Index_type l = 0; l < 8; ++l) {
+    const Index_type e = e0 + ((l < nel) ? l : nel - 1);
+    row[l] = &MEA_M(0, 0, 0, j1, j2, j3, e);
+  }
+
+  alignas(64) vd T[Q1][Q1][Q1];
+  RAJAPERF_FEM_STACK_ALIGN(T);
+  for (Index_type i3 = 0; i3 < D1; ++i3) {
+    RAJAPERF_FEM_UNROLL
+    for (Index_type k3 = 0; k3 < Q1; ++k3) {
+      const vd b3 = vset1(s_B[k3][i3] * s_B[k3][j3]);
+      for (Index_type k1 = 0; k1 < Q1; ++k1) {
+        RAJAPERF_FEM_UNROLL
+        for (Index_type k2 = 0; k2 < Q1; ++k2) {
+          T[k1][k2][k3] = vmul(b3, vload(s_D[k1][k2][k3]));
+        }
+      }
+    }
+    for (Index_type ip = 0; ip < 2; ++ip) {
+      vd acc[8];
+      RAJAPERF_FEM_UNROLL
+      for (Index_type r = 0; r < 8; ++r) {
+        acc[r] = vzero();
+      }
+      for (Index_type k1 = 0; k1 < Q1; ++k1) {
+        for (Index_type k2 = 0; k2 < Q1; ++k2) {
+          vd c[8];
+          RAJAPERF_FEM_UNROLL
+          for (Index_type r = 0; r < 8; ++r) {
+            c[r] = vset1(c12[ip][k1][k2][r]);
+          }
+          RAJAPERF_FEM_UNROLL
+          for (Index_type k3 = 0; k3 < Q1; ++k3) {
+            const vd t = T[k1][k2][k3];
+            RAJAPERF_FEM_UNROLL
+            for (Index_type r = 0; r < 8; ++r) {
+              acc[r] = vfma(c[r], t, acc[r]);
+            }
+          }
+        }
+      }
+      // acc[i1 + 4*ii] holds i = i1 + 4*(2*ip + ii) + 16*i3 for 8 lanes
+      transpose8(acc);
+      const Index_type off = D1 * D1 * i3 + 8 * ip;
+      for (Index_type l = 0; l < nel; ++l) {
+        vstore(row[l] + off, acc[l]);
+      }
+    }
+  }
+}
+
+#define MASS3DEA_CPU_SIMD_4 mass3dea_block_avx512(s_B, s_D, j1, j2, j3, M, e0, nel);
+#else
+#define MASS3DEA_CPU_SIMD_4 MASS3DEA_SIMD_4
+#endif
+
+//
+// Sum-factorized element assembly for the batch [e0, e0+FEM_VL) and one j3:
+//   M(i,j) = sum_k1 b(k1,i1,j1) sum_k2 b(k2,i2,j2) sum_k3 b(k3,i3,j3) D(k),
+//   b(k,i,j) = B(k,i) B(k,j): O(D^2Q^3 + D^4Q^2 + D^6Q) instead of O(D^6Q^3).
+// Each (j1,j2) block of 64 entries per element is written with streaming
+// stores when STREAM (and AVX-512) is available and M is 64B aligned.
+//
+template <bool STREAM>
+RAJAPERF_FEM_NOINLINE void mass3dea_sumfact_block(
+    rajaperf::Real_const_ptr B, rajaperf::Real_const_ptr D, rajaperf::Real_ptr M,
+    const rajaperf::Index_type NE, const rajaperf::Index_type e0,
+    const rajaperf::Index_type j3, const bool nt_ok)
+{
+  using rajaperf::Real_type;
+  using rajaperf::Index_type;
+  constexpr Index_type D1 = mea::D1D;
+  constexpr Index_type Q1 = mea::Q1D;
+  constexpr Index_type VL = FEM_VL;
+  constexpr Index_type NI = D1 * D1 * D1;
+
+  FEM_BATCH_SETUP(e0, NE);
+
+  Real_type bb[Q1][D1][D1];
+  for (Index_type k = 0; k < Q1; ++k) {
+    for (Index_type i = 0; i < D1; ++i) {
+      for (Index_type j = 0; j < D1; ++j) {
+        bb[k][i][j] = MEA_B(k, i) * MEA_B(k, j);
+      }
+    }
+  }
+
+  alignas(64) Real_type s_D[Q1][Q1][Q1][VL];
+  for (Index_type k1 = 0; k1 < Q1; ++k1) {
+    for (Index_type k2 = 0; k2 < Q1; ++k2) {
+      for (Index_type k3 = 0; k3 < Q1; ++k3) {
+        CPU_FOREACH_LANE(l) { s_D[k1][k2][k3][l] = MEA_D(k1, k2, k3, le[l]); }
+      }
+    }
+  }
+
+  // T3[i3][k1][k2] = sum_k3 b(k3,i3,j3) D[k1][k2][k3]
+  alignas(64) Real_type T3[D1][Q1][Q1][VL];
+  for (Index_type i3 = 0; i3 < D1; ++i3) {
+    for (Index_type k1 = 0; k1 < Q1; ++k1) {
+      for (Index_type k2 = 0; k2 < Q1; ++k2) {
+        CPU_FOREACH_LANE(l) {
+          Real_type s = 0.0;
+          for (Index_type k3 = 0; k3 < Q1; ++k3) {
+            s += bb[k3][i3][j3] * s_D[k1][k2][k3][l];
+          }
+          T3[i3][k1][k2][l] = s;
+        }
+      }
+    }
+  }
+
+  // T2[j2][i2][i3][k1] = sum_k2 b(k2,i2,j2) T3[i3][k1][k2]
+  alignas(64) Real_type T2[D1][D1][D1][Q1][VL];
+  for (Index_type j2 = 0; j2 < D1; ++j2) {
+    for (Index_type i2 = 0; i2 < D1; ++i2) {
+      for (Index_type i3 = 0; i3 < D1; ++i3) {
+        for (Index_type k1 = 0; k1 < Q1; ++k1) {
+          CPU_FOREACH_LANE(l) {
+            Real_type s = 0.0;
+            for (Index_type k2 = 0; k2 < Q1; ++k2) {
+              s += bb[k2][i2][j2] * T3[i3][k1][k2][l];
+            }
+            T2[j2][i2][i3][k1][l] = s;
+          }
+        }
+      }
+    }
+  }
+
+  Real_type *row[VL];
+  for (Index_type l = 0; l < VL; ++l) {
+    const Index_type e = le[l];
+    row[l] = &MEA_M(0, 0, 0, 0, 0, j3, e);
+  }
+
+  alignas(64) Real_type blk[NI][VL];
+  RAJAPERF_FEM_STACK_ALIGN(blk);
+  for (Index_type j2 = 0; j2 < D1; ++j2) {
+    for (Index_type j1 = 0; j1 < D1; ++j1) {
+      // blk[i1 + D1*(i2 + D1*i3)] = sum_k1 b(k1,i1,j1) T2[j2][i2][i3][k1]
+      for (Index_type i3 = 0; i3 < D1; ++i3) {
+        for (Index_type i2 = 0; i2 < D1; ++i2) {
+          for (Index_type i1 = 0; i1 < D1; ++i1) {
+            CPU_FOREACH_LANE(l) {
+              Real_type s = 0.0;
+              for (Index_type k1 = 0; k1 < Q1; ++k1) {
+                s += bb[k1][i1][j1] * T2[j2][i2][i3][k1][l];
+              }
+              blk[i1 + D1 * (i2 + D1 * i3)][l] = s;
+            }
+          }
+        }
+      }
+      const Index_type off = NI * (j1 + D1 * j2);
+#if defined(RAJAPERF_FEM_AVX512)
+      using namespace rajaperf::fem_simd;
+      const bool nt = STREAM && nt_ok && nel == VL;
+      for (Index_type c = 0; c < NI; c += 8) {
+        vd r[8];
+        for (Index_type k = 0; k < 8; ++k) {
+          r[k] = _mm512_load_pd(blk[c + k]);
+        }
+        transpose8(r);
+        if (nt) {
+          for (Index_type l = 0; l < VL; ++l) {
+            _mm512_stream_pd(row[l] + off + c, r[l]);
+          }
+        } else {
+          for (Index_type l = 0; l < nel; ++l) {
+            vstore(row[l] + off + c, r[l]);
+          }
+        }
+      }
+#else
+      RAJA_UNUSED_VAR(nt_ok);
+      for (Index_type l = 0; l < nel; ++l) {
+        for (Index_type i = 0; i < NI; ++i) {
+          row[l][off + i] = blk[i][l];
+        }
+      }
+#endif
+    }
+  }
+}
+
 namespace rajaperf {
 class RunParams;
 
@@ -219,6 +445,7 @@ public:
   void defineSyclVariantTunings();
 
   void runSeqVariant(VariantID vid);
+  template <size_t tune_idx>
   void runOpenMPVariant(VariantID vid);
 
   template <size_t block_size, size_t tune_idx>

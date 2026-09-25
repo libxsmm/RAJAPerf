@@ -135,6 +135,7 @@
   Index_type NE = m_NE;
 
 #include "FEM_MACROS.hpp"
+#include "FEM_SIMD.hpp"
 #include "common/KernelBase.hpp"
 
 #include "RAJA/RAJA.hpp"
@@ -329,6 +330,77 @@ constexpr RAJA::Index_type DIM = 3;
     }                                                                          \
   }
 
+#if defined(RAJAPERF_FEM_AVX512)
+//
+// AVX-512 batch of FEM_VL elements [e0, e0+nel): AoS <-> SoA through 8x8
+// in-register transposes of each element's contiguous D, X and Y blocks
+// instead of gathers/scatters; stages 3-8 via fem_simd::mass_pa_apply.
+//
+template <bool STREAM = false>
+RAJAPERF_FEM_NOINLINE void massvec3dpa_batch_avx512(
+    rajaperf::Real_const_ptr B, rajaperf::Real_const_ptr D,
+    rajaperf::Real_const_ptr X, rajaperf::Real_ptr Y,
+    const rajaperf::Index_type e0, const rajaperf::Index_type nel)
+{
+  using namespace rajaperf::fem_simd;
+  using rajaperf::Real_type;
+  using rajaperf::Index_type;
+  constexpr Index_type D1 = mvpa::D1D;
+  constexpr Index_type Q1 = mvpa::Q1D;
+
+  Real_type b[Q1][D1];
+  for (Index_type d = 0; d < D1; ++d) {
+    for (Index_type q = 0; q < Q1; ++q) {
+      b[q][d] = MVPA_B(q, d);
+    }
+  }
+
+  Index_type el[8];
+  for (Index_type l = 0; l < 8; ++l) {
+    el[l] = e0 + ((l < nel) ? l : nel - 1);
+  }
+
+  alignas(64) vd dv[Q1 * Q1 * Q1];
+  RAJAPERF_FEM_STACK_ALIGN(dv);
+  {
+    const Real_type *drow[8];
+    for (Index_type l = 0; l < 8; ++l) {
+      const Index_type e = el[l];
+      drow[l] = &MVPA_D(0, 0, 0, e);
+    }
+    load_transpose<Q1 * Q1 * Q1>(drow, dv);
+  }
+
+  // a full batch's Y is one contiguous block of 8*81 doubles (64B aligned when
+  // Y is): stage it in L1 and write it with streaming stores
+  constexpr Index_type NY = mvpa::DIM * D1 * D1 * D1;
+  Real_type *const ybatch = &Y[NY * e0];
+  const bool nt = STREAM && nel == 8 && is_aligned64(ybatch);
+  alignas(64) Real_type ybuf[8 * NY];
+
+  for (Index_type c = 0; c < mvpa::DIM; ++c) {
+    const Real_type *xrow[8];
+    Real_type *yrow[8];
+    for (Index_type l = 0; l < 8; ++l) {
+      const Index_type e = el[l];
+      xrow[l] = &MVPA_X(0, 0, 0, c, e);
+      yrow[l] = nt ? ybuf + NY * l + D1 * D1 * D1 * c : &MVPA_Y(0, 0, 0, c, e);
+    }
+    alignas(64) vd x[D1 * D1 * D1];
+    alignas(64) vd y[D1 * D1 * D1];
+    load_transpose<D1 * D1 * D1>(xrow, x);
+    mass_pa_apply<D1, Q1>(b, x, dv, y);
+    transpose_store<D1 * D1 * D1>(yrow, nel, y);
+  }
+  if (nt) {
+    stream_copy(ybatch, ybuf, 8 * NY);
+  }
+}
+
+#define MASSVEC3DPA_CPU_SIMD_BATCH                                             \
+  massvec3dpa_batch_avx512(B, D, X, Y, e0, (NE - e0 < FEM_VL) ? NE - e0 : FEM_VL);
+#endif
+
 namespace rajaperf {
 class RunParams;
 
@@ -352,6 +424,7 @@ public:
   void defineSyclVariantTunings();
 
   void runSeqVariant(VariantID vid);
+  template <size_t tune_idx>
   void runOpenMPVariant(VariantID vid);
 
   template <size_t block_size, size_t tune_idx>

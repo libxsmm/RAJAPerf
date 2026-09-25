@@ -20,6 +20,9 @@ namespace rajaperf
 namespace apps
 {
 
+// tune_idx 0: one intersection per iteration; 1: one donor zone (its eight
+// intersections) per iteration with plane splitting
+template < size_t tune_idx >
 void INTSC_HEXRECT::runOpenMPVariant(VariantID vid)
 {
 #if defined(RAJA_ENABLE_OPENMP) && defined(RUN_OPENMP)
@@ -29,12 +32,17 @@ void INTSC_HEXRECT::runOpenMPVariant(VariantID vid)
   //  standard intersections among threads, iend is getActualProblemSize.
   const Index_type run_reps = getRunReps();
   const Index_type ibegin = 0 ;
-  const Index_type iend = m_nrecords ;
+  const Index_type iend = ( tune_idx == 0 ) ? m_nrecords
+                                            : m_nrecords / intsc_per_zone ;
 
   INTSC_HEXRECT_DATA_SETUP ;
 
   auto intsc_hexrect_lam = [=] ( Index_type i ) {
-      INTSC_HEXRECT_OMP ( i ) ;
+      if constexpr ( tune_idx == 0 ) {
+        INTSC_HEXRECT_OMP ( i ) ;
+      } else {
+        INTSC_HEXRECT_SPLIT_BODY ( i ) ;
+      }
   } ;
 
   switch ( vid ) {
@@ -48,7 +56,11 @@ void INTSC_HEXRECT::runOpenMPVariant(VariantID vid)
         RP_CALI_SUBKERNEL_BEGIN("INTSC_HEXRECT_1");
         #pragma omp parallel for
         for (Index_type i = ibegin ; i < iend ; ++i ) {
-          INTSC_HEXRECT_OMP( i ) ;
+          if constexpr ( tune_idx == 0 ) {
+            INTSC_HEXRECT_OMP( i ) ;
+          } else {
+            INTSC_HEXRECT_SPLIT_BODY( i ) ;
+          }
         }
         RP_CALI_SUBKERNEL_END("INTSC_HEXRECT_1");
 
@@ -107,7 +119,14 @@ void INTSC_HEXRECT::runOpenMPVariant(VariantID vid)
 #endif
 }
 
-RAJAPERF_DEFAULT_TUNING_DEFINE_BOILERPLATE(INTSC_HEXRECT, OpenMP, Base_OpenMP, Lambda_OpenMP, RAJA_OpenMP)
+void INTSC_HEXRECT::defineOpenMPVariantTunings()
+{
+  for (VariantID vid : {Base_OpenMP, Lambda_OpenMP, RAJA_OpenMP}) {
+    addVariantTuning<&INTSC_HEXRECT::runOpenMPVariant<0>>(vid, getDefaultTuningName());
+    // same result; less work than setFLOPsPerRep() counts
+    addVariantTuning<&INTSC_HEXRECT::runOpenMPVariant<1>>(vid, "split");
+  }
+}
 
 } // end namespace apps
 } // end namespace rajaperf

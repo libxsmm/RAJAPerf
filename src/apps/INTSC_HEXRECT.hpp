@@ -122,6 +122,7 @@ public:
   void defineHipVariantTunings();
 
   void runSeqVariant(VariantID vid);
+  template < size_t tune_idx >
   void runOpenMPVariant(VariantID vid);
 
   template < Size_type block_size >

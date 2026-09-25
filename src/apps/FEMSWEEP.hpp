@@ -95,6 +95,7 @@
 #include "FEMSWEEPMeshGen.hpp"
 
 #include "FEM_MACROS.hpp"
+#include "FEM_SIMD.hpp"
 
 constexpr long ND = 8;   // number of corners per element
 constexpr long NLF = 6;  // number of faces per element
@@ -337,6 +338,82 @@ RAJA_INLINE void SolveLinearSystemNxN_simd(Real_const_ptr A,
   // In-place Crout LU: LU[i][j] holds L for j <= i and unit-diagonal U for j > i.
   // Same operation order as SolveLinearSystemNxN minus its products with
   // known-zero entries; one reciprocal per diagonal replaces repeated divides.
+#if defined(RAJAPERF_FEM_AVX512)
+  using namespace fem_simd;
+  // fully unrolled: all N*N LU entries are SSA values, no lane loops
+  vd LU[N][N];
+  vd rinv[N];
+  vd D[N];
+  const vd vs = vload(s);
+
+  RAJAPERF_FEM_UNROLL
+  for ( Index_type ii = 0; ii < N; ++ii )
+  {
+    RAJAPERF_FEM_UNROLL
+    for ( Index_type jj = 0; jj < N; ++jj )
+    {
+      LU[ii][jj] = vfma(vs, vset1(M[ii * N + jj]), vset1(A[ii * N + jj]));
+    }
+  }
+
+  RAJAPERF_FEM_UNROLL
+  for ( Index_type ii = 0; ii < N; ++ii )
+  {
+    RAJAPERF_FEM_UNROLL
+    for ( Index_type jj = ii; jj < N; ++jj )
+    {
+      vd sum = vzero();
+      RAJAPERF_FEM_UNROLL
+      for ( Index_type kk = 0; kk < ii; ++kk )
+      {
+        sum = vfma(LU[jj][kk], LU[kk][ii], sum);
+      }
+      LU[jj][ii] = vsub(LU[jj][ii], sum);
+    }
+
+    rinv[ii] = vdiv(vset1(1.0), LU[ii][ii]);
+
+    RAJAPERF_FEM_UNROLL
+    for ( Index_type jj = ii+1; jj < N; ++jj )
+    {
+      vd sum = vzero();
+      RAJAPERF_FEM_UNROLL
+      for ( Index_type kk = 0; kk < ii; ++kk )
+      {
+        sum = vfma(LU[ii][kk], LU[kk][jj], sum);
+      }
+      LU[ii][jj] = vmul(vsub(LU[ii][jj], sum), rinv[ii]);
+    }
+  }
+
+  RAJAPERF_FEM_UNROLL
+  for ( Index_type ii = 0; ii < N; ++ii )
+  {
+    vd sum = vzero();
+    RAJAPERF_FEM_UNROLL
+    for ( Index_type jj = 0; jj < ii; ++jj )
+    {
+      sum = vfma(LU[ii][jj], D[jj], sum);
+    }
+    D[ii] = vmul(vsub(vload(b[ii]), sum), rinv[ii]);
+  }
+
+  vstore(x[N-1], D[N-1]);
+  vd xv[N];
+  xv[N-1] = D[N-1];
+  RAJAPERF_FEM_UNROLL
+  for ( Index_type ii = N - 1 - 1; ii > -1; --ii )
+  {
+    vd sum = vzero();
+    RAJAPERF_FEM_UNROLL
+    for ( Index_type jj = ii+1; jj < N; ++jj )
+    {
+      sum = vfma(LU[ii][jj], xv[jj], sum);
+    }
+    xv[ii] = vsub(D[ii], sum);
+    vstore(x[ii], xv[ii]);
+  }
+#else
   Real_type LU[N][N][FEM_VL];
   Real_type rinv[N][FEM_VL];
   Real_type D[N][FEM_VL];
@@ -402,6 +479,7 @@ RAJA_INLINE void SolveLinearSystemNxN_simd(Real_const_ptr A,
     }
     CPU_FOREACH_LANE(l) { x[ii][l] = D[ii][l] - sum[l]; }
   }
+#endif
 }
 
 // Spin barrier for a team of concurrently running threads.

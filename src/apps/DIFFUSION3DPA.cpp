@@ -79,10 +79,10 @@ DIFFUSION3DPA::~DIFFUSION3DPA()
 void DIFFUSION3DPA::setUp(VariantID vid, size_t RAJAPERF_UNUSED_ARG(tune_idx))
 {
 
-  allocAndInitDataConst(m_B, diff::Q1D*diff::D1D, Real_type(1.0), vid);
-  allocAndInitDataConst(m_G, diff::Q1D*diff::D1D, Real_type(1.0), vid);
-  allocAndInitDataConst(m_D, diff::Q1D*diff::Q1D*diff::Q1D*diff::DPA_SYM*m_NE, Real_type(1.0), vid);
-  allocAndInitDataConst(m_X, diff::D1D*diff::D1D*diff::D1D*m_NE, Real_type(1.0), vid);
+  allocAndInitDataRandValue(m_B, diff::Q1D*diff::D1D, vid);
+  allocAndInitDataRandValue(m_G, diff::Q1D*diff::D1D, vid);
+  allocAndInitDataRandValue(m_D, diff::Q1D*diff::Q1D*diff::Q1D*diff::DPA_SYM*m_NE, vid);
+  allocAndInitDataRandValue(m_X, diff::D1D*diff::D1D*diff::D1D*m_NE, vid);
   allocAndInitDataConst(m_Y, diff::D1D*diff::D1D*diff::D1D*m_NE, Real_type(0.0), vid);
 }
 

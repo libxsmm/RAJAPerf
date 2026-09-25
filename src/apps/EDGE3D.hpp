@@ -192,6 +192,7 @@
 #define NQ_1D 2
 
 #include "mixed_fem_helper.hpp"
+#include "FEM_SIMD.hpp"
 
 RAJA_HOST_DEVICE
 RAJA_INLINE void edge_MpSmatrix(
@@ -631,6 +632,460 @@ RAJA_INLINE void edge_MpSmatrix_simd(
   }
 }
 
+//
+// Same algorithm as edge_MpSmatrix_sum_avx512 below, in plain C++ with one
+// compiler-vectorized lane loop per quadrature point.
+//
+template <rajaperf::Int_type quad_order>
+RAJAPERF_FEM_NOINLINE void edge_MpSmatrix_sum_simd(
+  const rajaperf::Real_type *const (&xn)[NB],
+  const rajaperf::Real_type *const (&yn)[NB],
+  const rajaperf::Real_type *const (&zn)[NB],
+  const rajaperf::Index_type nel,
+  const rajaperf::Real_type  alpha,
+  const rajaperf::Real_type  beta,
+  const rajaperf::Real_type  detj_tol,
+  const rajaperf::Int_type   quad_type,
+  rajaperf::Real_type       *sum)
+{
+  using rajaperf::Real_type;
+  using rajaperf::Int_type;
+  using rajaperf::Index_type;
+  constexpr Int_type VL = EDGE3D_VL;
+  constexpr Int_type NU = EB * (EB + 1) / 2;
+
+  alignas(64) Real_type dxi[3][4][VL], deta[3][4][VL], dzeta[3][4][VL];
+  alignas(64) Real_type detj_cc[VL];
+  FEM_OMP_SIMD
+  for (Int_type e = 0; e < VL; e++) {
+    const Index_type l = (e < nel) ? e : nel - 1;
+    Real_type C[3][NB];
+    for (Int_type n = 0; n < NB; n++) {
+      C[0][n] = xn[n][l];
+      C[1][n] = yn[n][l];
+      C[2][n] = zn[n][l];
+    }
+    for (Int_type c = 0; c < 3; c++) {
+      dxi[c][0][e] = C[c][1] - C[c][0];   dxi[c][1][e] = C[c][2] - C[c][3];
+      dxi[c][2][e] = C[c][5] - C[c][4];   dxi[c][3][e] = C[c][6] - C[c][7];
+      deta[c][0][e] = C[c][3] - C[c][0];  deta[c][1][e] = C[c][2] - C[c][1];
+      deta[c][2][e] = C[c][7] - C[c][4];  deta[c][3][e] = C[c][6] - C[c][5];
+      dzeta[c][0][e] = C[c][4] - C[c][0]; dzeta[c][1][e] = C[c][5] - C[c][1];
+      dzeta[c][2][e] = C[c][6] - C[c][2]; dzeta[c][3][e] = C[c][7] - C[c][3];
+    }
+    Real_type J[3][3];
+    for (Int_type c = 0; c < 3; c++) {
+      J[0][c] = 0.25 * (dxi[c][0][e] + dxi[c][1][e] + dxi[c][2][e] + dxi[c][3][e]);
+      J[1][c] = 0.25 * (deta[c][0][e] + deta[c][1][e] + deta[c][2][e] + deta[c][3][e]);
+      J[2][c] = 0.25 * (dzeta[c][0][e] + dzeta[c][1][e] + dzeta[c][2][e] + dzeta[c][3][e]);
+    }
+    detj_cc[e] = compute_detj(J[0][0], J[0][1], J[0][2], J[1][0], J[1][1],
+                              J[1][2], J[2][0], J[2][1], J[2][2]);
+  }
+
+  Real_type qpts_1d[MAX_QUAD_ORDER];
+  Real_type wgts_1d[MAX_QUAD_ORDER];
+  get_quadrature_rule(quad_type, quad_order, qpts_1d, wgts_1d);
+
+  alignas(64) Real_type Mu[NU][VL];
+  RAJAPERF_FEM_STACK_ALIGN(Mu);
+  for (Int_type u = 0; u < NU; u++) {
+    FEM_OMP_SIMD
+    for (Int_type e = 0; e < VL; e++) {
+      Mu[u][e] = 0.0;
+    }
+  }
+
+  constexpr Int_type nz1[3] = {1, 0, 0};
+  constexpr Int_type nz2[3] = {2, 2, 1};
+  constexpr Int_type sym[3][3] = {{0, 1, 2}, {1, 3, 4}, {2, 4, 5}};
+
+  for (Int_type i = 0; i < quad_order; i++) {
+    const Real_type xloc = qpts_1d[i];
+    const Real_type tmpx = 1. - xloc;
+    RAJAPERF_FEM_UNROLL
+    for (Int_type j = 0; j < quad_order; j++) {
+      const Real_type yloc = qpts_1d[j];
+      const Real_type wgtxy = wgts_1d[i]*wgts_1d[j];
+      const Real_type tmpy = 1. - yloc;
+      const Real_type tmpxy    = tmpx*tmpy;
+      const Real_type xyloc    = xloc*yloc;
+      const Real_type tmpxyloc = tmpx*yloc;
+      const Real_type xloctmpy = xloc*tmpy;
+      RAJAPERF_FEM_UNROLL
+      for (Int_type k = 0; k < quad_order; k++) {
+        const Real_type zloc = qpts_1d[k];
+        const Real_type wgts = wgtxy*wgts_1d[k];
+        const Real_type tmpz = 1. - zloc;
+        const Real_type tmpxz    = tmpx*tmpz;
+        const Real_type tmpyz    = tmpy*tmpz;
+        const Real_type xzloc    = xloc*zloc;
+        const Real_type yzloc    = yloc*zloc;
+        const Real_type tmpyzloc = tmpy*zloc;
+        const Real_type tmpxzloc = tmpx*zloc;
+        const Real_type yloctmpz = yloc*tmpz;
+        const Real_type xloctmpz = xloc*tmpz;
+
+        const Real_type s[EB] = {tmpyz, yloctmpz, tmpyzloc, yzloc,
+                                 tmpxz, xloctmpz, tmpxzloc, xzloc,
+                                 tmpxy, xloctmpy, tmpxyloc, xyloc};
+        const Real_type db[EB][3] = {
+          {0.0, -tmpy,  tmpz}, {0.0, -yloc, -tmpz},
+          {0.0,  tmpy,  zloc}, {0.0,  yloc, -zloc},
+          { tmpx, 0.0, -tmpz}, { xloc, 0.0,  tmpz},
+          {-tmpx, 0.0, -zloc}, {-xloc, 0.0,  zloc},
+          {-tmpx,  tmpy, 0.0}, {-xloc, -tmpy, 0.0},
+          { tmpx,  yloc, 0.0}, { xloc, -yloc, 0.0}};
+
+        FEM_OMP_SIMD
+        for (Int_type e = 0; e < VL; e++) {
+          auto comb = [e](const Real_type (&d)[4][VL], Real_type w0,
+                          Real_type w1, Real_type w2, Real_type w3) {
+            return d[0][e]*w0 + d[1][e]*w1 + d[2][e]*w2 + d[3][e]*w3;
+          };
+          const Real_type jxx = comb(dxi[0], tmpyz, yloctmpz, tmpyzloc, yzloc);
+          const Real_type jxy = comb(dxi[1], tmpyz, yloctmpz, tmpyzloc, yzloc);
+          const Real_type jxz = comb(dxi[2], tmpyz, yloctmpz, tmpyzloc, yzloc);
+          const Real_type jyx = comb(deta[0], tmpxz, xloctmpz, tmpxzloc, xzloc);
+          const Real_type jyy = comb(deta[1], tmpxz, xloctmpz, tmpxzloc, xzloc);
+          const Real_type jyz = comb(deta[2], tmpxz, xloctmpz, tmpxzloc, xzloc);
+          const Real_type jzx = comb(dzeta[0], tmpxy, xloctmpy, xyloc, tmpxyloc);
+          const Real_type jzy = comb(dzeta[1], tmpxy, xloctmpy, xyloc, tmpxyloc);
+          const Real_type jzz = comb(dzeta[2], tmpxy, xloctmpy, xyloc, tmpxyloc);
+
+          const Real_type kxx = jyy*jzz - jyz*jzy;
+          const Real_type kxy = jxz*jzy - jxy*jzz;
+          const Real_type kxz = jxy*jyz - jxz*jyy;
+          const Real_type kyx = jyz*jzx - jyx*jzz;
+          const Real_type kyy = jxx*jzz - jxz*jzx;
+          const Real_type kyz = jxz*jyx - jxx*jyz;
+          const Real_type kzx = jyx*jzy - jyy*jzx;
+          const Real_type kzy = jxy*jzx - jxx*jzy;
+          const Real_type kzz = jxx*jyy - jxy*jyx;
+
+          const Real_type detj_unfixed = jzx*kxz + jzy*kyz + jzz*kzz;
+          const Real_type detj =
+            (fabs(detj_unfixed) < detj_tol*fabs(detj_cc[e])) ? detj_cc[e]
+                                                              : detj_unfixed;
+          const Real_type abs_detj = fabs(detj);
+          const Real_type inv_detj = 1.0/(detj + ptiny);
+          const Real_type inv_abs_detj = 1.0/(abs_detj + ptiny);
+          const Real_type wdet = wgts*abs_detj;
+          const Real_type sG = alpha*wdet*inv_detj*inv_detj;
+          const Real_type sH = beta*wdet*inv_abs_detj*inv_abs_detj;
+
+          const Real_type WG[6] = {
+            sG*(kxx*kxx + kyx*kyx + kzx*kzx), sG*(kxx*kxy + kyx*kyy + kzx*kzy),
+            sG*(kxx*kxz + kyx*kyz + kzx*kzz), sG*(kxy*kxy + kyy*kyy + kzy*kzy),
+            sG*(kxy*kxz + kyy*kyz + kzy*kzz), sG*(kxz*kxz + kyz*kyz + kzz*kzz)};
+          const Real_type WH[6] = {
+            sH*(jxx*jxx + jxy*jxy + jxz*jxz), sH*(jxx*jyx + jxy*jyy + jxz*jyz),
+            sH*(jxx*jzx + jxy*jzy + jxz*jzz), sH*(jyx*jyx + jyy*jyy + jyz*jyz),
+            sH*(jyx*jzx + jyy*jzy + jyz*jzz), sH*(jzx*jzx + jzy*jzy + jzz*jzz)};
+
+          Real_type v[EB][3];
+          RAJAPERF_FEM_UNROLL
+          for (Int_type m = 0; m < EB; m++) {
+            const Int_type a1 = nz1[m / 4], a2 = nz2[m / 4];
+            RAJAPERF_FEM_UNROLL
+            for (Int_type c = 0; c < 3; c++) {
+              v[m][c] = WH[sym[c][a1]]*db[m][a1] + WH[sym[c][a2]]*db[m][a2];
+            }
+          }
+
+          Int_type u = 0;
+          RAJAPERF_FEM_UNROLL
+          for (Int_type p = 0; p < EB; p++) {
+            const Int_type gp = p / 4;
+            const Int_type a1 = nz1[gp], a2 = nz2[gp];
+            RAJAPERF_FEM_UNROLL
+            for (Int_type m = p; m < EB; m++, u++) {
+              Mu[u][e] += s[m]*(s[p]*WG[sym[gp][m / 4]]) +
+                          db[p][a1]*v[m][a1] + db[p][a2]*v[m][a2];
+            }
+          }
+        }
+      }
+    }
+  }
+
+  FEM_OMP_SIMD
+  for (Int_type e = 0; e < VL; e++) {
+    Real_type sdiag = 0.0, soff = 0.0;
+    Int_type u = 0;
+    for (Int_type p = 0; p < EB; p++) {
+      sdiag += Mu[u++][e];
+      for (Int_type m = p + 1; m < EB; m++) {
+        soff += Mu[u++][e];
+      }
+    }
+    if (e < nel) {
+      sum[e] = sdiag + 2.0*soff;
+    }
+  }
+}
+
+#if defined(RAJAPERF_FEM_AVX512)
+//
+// AVX-512 variant of edge_MpSmatrix_simd + row sum for one batch.
+// Uses the basis structure: w_m = s_m e_{m/4} and Curl(w_m) has two nonzero
+// components, so with G = J^{-T}J^{-1} and H = J J^T / |J|^2 every matrix
+// entry update is three FMAs:
+//   M[p][m] += s_p s_m walpha G[p/4][m/4] + wbeta db_p^T H db_m.
+//
+template <rajaperf::Int_type quad_order, bool STORE_MATRIX = false>
+RAJAPERF_FEM_NOINLINE void edge_MpSmatrix_sum_avx512(
+  const rajaperf::Real_type *const (&xn)[NB],
+  const rajaperf::Real_type *const (&yn)[NB],
+  const rajaperf::Real_type *const (&zn)[NB],
+  const rajaperf::Index_type nel,
+  const rajaperf::Real_type  alpha,
+  const rajaperf::Real_type  beta,
+  const rajaperf::Real_type  detj_tol,
+  const rajaperf::Int_type   quad_type,
+  rajaperf::Real_type       *sum,
+  rajaperf::Real_type       *matrix = nullptr)
+{
+  using namespace rajaperf::fem_simd;
+  using rajaperf::Real_type;
+  using rajaperf::Int_type;
+
+  // tail lanes replicate the last valid element
+  const __m512i cidx = _mm512_min_epi64(_mm512_set_epi64(7, 6, 5, 4, 3, 2, 1, 0),
+                                        _mm512_set1_epi64(nel - 1));
+  const vmask lm = lane_mask(nel);
+  auto load_lanes = [&](const Real_type *p) {
+    return (nel == FEM_VL) ? vload(p)
+                           : _mm512_permutexvar_pd(cidx, vload(lm, p));
+  };
+
+  alignas(64) vd C[3][NB];
+  for (Int_type n = 0; n < NB; n++) {
+    C[0][n] = load_lanes(xn[n]);
+    C[1][n] = load_lanes(yn[n]);
+    C[2][n] = load_lanes(zn[n]);
+  }
+
+  // node differences of soa_dxi / soa_deta / soa_dzeta per coordinate
+  alignas(64) vd dxi[3][4], deta[3][4], dzeta[3][4];
+  for (Int_type c = 0; c < 3; c++) {
+    dxi[c][0] = vsub(C[c][1], C[c][0]);   dxi[c][1] = vsub(C[c][2], C[c][3]);
+    dxi[c][2] = vsub(C[c][5], C[c][4]);   dxi[c][3] = vsub(C[c][6], C[c][7]);
+    deta[c][0] = vsub(C[c][3], C[c][0]);  deta[c][1] = vsub(C[c][2], C[c][1]);
+    deta[c][2] = vsub(C[c][7], C[c][4]);  deta[c][3] = vsub(C[c][6], C[c][5]);
+    dzeta[c][0] = vsub(C[c][4], C[c][0]); dzeta[c][1] = vsub(C[c][5], C[c][1]);
+    dzeta[c][2] = vsub(C[c][6], C[c][2]); dzeta[c][3] = vsub(C[c][7], C[c][3]);
+  }
+  auto comb = [](const vd (&d)[4], Real_type w0, Real_type w1,
+                 Real_type w2, Real_type w3) {
+    return vfma(d[3], vset1(w3),
+           vfma(d[2], vset1(w2),
+           vfma(d[1], vset1(w1), vmul(d[0], vset1(w0)))));
+  };
+
+  // detj = jzx*kxz + jzy*kyz + jzz*kzz with cofactors k of J
+  auto detj_of = [](vd jxx, vd jxy, vd jxz, vd jyx, vd jyy, vd jyz,
+                    vd jzx, vd jzy, vd jzz) {
+    const vd kxz = vfms(jxy, jyz, vmul(jxz, jyy));
+    const vd kyz = vfms(jxz, jyx, vmul(jxx, jyz));
+    const vd kzz = vfms(jxx, jyy, vmul(jxy, jyx));
+    return vfma(jzz, kzz, vfma(jzy, kyz, vmul(jzx, kxz)));
+  };
+
+  const vd detj_cc = detj_of(
+    comb(dxi[0], 0.25, 0.25, 0.25, 0.25), comb(dxi[1], 0.25, 0.25, 0.25, 0.25),
+    comb(dxi[2], 0.25, 0.25, 0.25, 0.25), comb(deta[0], 0.25, 0.25, 0.25, 0.25),
+    comb(deta[1], 0.25, 0.25, 0.25, 0.25), comb(deta[2], 0.25, 0.25, 0.25, 0.25),
+    comb(dzeta[0], 0.25, 0.25, 0.25, 0.25), comb(dzeta[1], 0.25, 0.25, 0.25, 0.25),
+    comb(dzeta[2], 0.25, 0.25, 0.25, 0.25));
+  const vd tol_abs_detj_cc = vmul(vset1(detj_tol), vabs(detj_cc));
+  const vd vtiny = vset1(ptiny);
+  const vd vone = vset1(1.0);
+
+  Real_type qpts_1d[MAX_QUAD_ORDER];
+  Real_type wgts_1d[MAX_QUAD_ORDER];
+  get_quadrature_rule(quad_type, quad_order, qpts_1d, wgts_1d);
+
+  // upper triangle, row major
+  constexpr Int_type NU = EB * (EB + 1) / 2;
+  alignas(64) vd Mu[NU];
+  RAJAPERF_FEM_STACK_ALIGN(Mu);
+  for (Int_type u = 0; u < NU; u++) {
+    Mu[u] = vzero();
+  }
+
+  // nonzero components of Curl(w_m) for m in group m/4
+  constexpr Int_type nz1[3] = {1, 0, 0};
+  constexpr Int_type nz2[3] = {2, 2, 1};
+  // index into symmetric 3x3 storage {00, 01, 02, 11, 12, 22}
+  constexpr Int_type sym[3][3] = {{0, 1, 2}, {1, 3, 4}, {2, 4, 5}};
+
+  for (Int_type i = 0; i < quad_order; i++) {
+
+    const Real_type xloc = qpts_1d[i];
+    const Real_type tmpx = 1. - xloc;
+
+    RAJAPERF_FEM_UNROLL
+    for (Int_type j = 0; j < quad_order; j++) {
+
+      const Real_type yloc = qpts_1d[j];
+      const Real_type wgtxy = wgts_1d[i]*wgts_1d[j];
+      const Real_type tmpy = 1. - yloc;
+
+      const Real_type tmpxy    = tmpx*tmpy;
+      const Real_type xyloc    = xloc*yloc;
+      const Real_type tmpxyloc = tmpx*yloc;
+      const Real_type xloctmpy = xloc*tmpy;
+
+      const vd jzx = comb(dzeta[0], tmpxy, xloctmpy, xyloc, tmpxyloc);
+      const vd jzy = comb(dzeta[1], tmpxy, xloctmpy, xyloc, tmpxyloc);
+      const vd jzz = comb(dzeta[2], tmpxy, xloctmpy, xyloc, tmpxyloc);
+
+      RAJAPERF_FEM_UNROLL
+      for (Int_type k = 0; k < quad_order; k++) {
+
+        const Real_type zloc = qpts_1d[k];
+        const Real_type wgts = wgtxy*wgts_1d[k];
+        const Real_type tmpz = 1. - zloc;
+
+        const Real_type tmpxz    = tmpx*tmpz;
+        const Real_type tmpyz    = tmpy*tmpz;
+        const Real_type xzloc    = xloc*zloc;
+        const Real_type yzloc    = yloc*zloc;
+        const Real_type tmpyzloc = tmpy*zloc;
+        const Real_type tmpxzloc = tmpx*zloc;
+        const Real_type yloctmpz = yloc*tmpz;
+        const Real_type xloctmpz = xloc*tmpz;
+
+        const vd jxx = comb(dxi[0], tmpyz, yloctmpz, tmpyzloc, yzloc);
+        const vd jxy = comb(dxi[1], tmpyz, yloctmpz, tmpyzloc, yzloc);
+        const vd jxz = comb(dxi[2], tmpyz, yloctmpz, tmpyzloc, yzloc);
+        const vd jyx = comb(deta[0], tmpxz, xloctmpz, tmpxzloc, xzloc);
+        const vd jyy = comb(deta[1], tmpxz, xloctmpz, tmpxzloc, xzloc);
+        const vd jyz = comb(deta[2], tmpxz, xloctmpz, tmpxzloc, xzloc);
+
+        // cofactors: J^{-1} = K / detj
+        const vd kxx = vfms(jyy, jzz, vmul(jyz, jzy));
+        const vd kxy = vfms(jxz, jzy, vmul(jxy, jzz));
+        const vd kxz = vfms(jxy, jyz, vmul(jxz, jyy));
+        const vd kyx = vfms(jyz, jzx, vmul(jyx, jzz));
+        const vd kyy = vfms(jxx, jzz, vmul(jxz, jzx));
+        const vd kyz = vfms(jxz, jyx, vmul(jxx, jyz));
+        const vd kzx = vfms(jyx, jzy, vmul(jyy, jzx));
+        const vd kzy = vfms(jxy, jzx, vmul(jxx, jzy));
+        const vd kzz = vfms(jxx, jyy, vmul(jxy, jyx));
+
+        // bad_zone_algorithm
+        const vd detj_unfixed = vfma(jzz, kzz, vfma(jzy, kyz, vmul(jzx, kxz)));
+        const vmask bad = _mm512_cmp_pd_mask(vabs(detj_unfixed),
+                                             tol_abs_detj_cc, _CMP_LT_OQ);
+        const vd detj = _mm512_mask_blend_pd(bad, detj_unfixed, detj_cc);
+        const vd abs_detj = vabs(detj);
+        const vd inv_detj = vdiv(vone, vadd(detj, vtiny));
+        const vd inv_abs_detj = vdiv(vone, vadd(abs_detj, vtiny));
+
+        // walpha / detj^2 and wbeta / |detj|^2
+        const vd wdet = vmul(vset1(wgts), abs_detj);
+        const vd sG = vmul(vmul(vset1(alpha), wdet), vmul(inv_detj, inv_detj));
+        const vd sH = vmul(vmul(vset1(beta), wdet),
+                           vmul(inv_abs_detj, inv_abs_detj));
+
+        alignas(64) vd WG[6], WH[6];
+        WG[0] = vmul(sG, vfma(kzx, kzx, vfma(kyx, kyx, vmul(kxx, kxx))));
+        WG[1] = vmul(sG, vfma(kzx, kzy, vfma(kyx, kyy, vmul(kxx, kxy))));
+        WG[2] = vmul(sG, vfma(kzx, kzz, vfma(kyx, kyz, vmul(kxx, kxz))));
+        WG[3] = vmul(sG, vfma(kzy, kzy, vfma(kyy, kyy, vmul(kxy, kxy))));
+        WG[4] = vmul(sG, vfma(kzy, kzz, vfma(kyy, kyz, vmul(kxy, kxz))));
+        WG[5] = vmul(sG, vfma(kzz, kzz, vfma(kyz, kyz, vmul(kxz, kxz))));
+        WH[0] = vmul(sH, vfma(jxz, jxz, vfma(jxy, jxy, vmul(jxx, jxx))));
+        WH[1] = vmul(sH, vfma(jxz, jyz, vfma(jxy, jyy, vmul(jxx, jyx))));
+        WH[2] = vmul(sH, vfma(jxz, jzz, vfma(jxy, jzy, vmul(jxx, jzx))));
+        WH[3] = vmul(sH, vfma(jyz, jyz, vfma(jyy, jyy, vmul(jyx, jyx))));
+        WH[4] = vmul(sH, vfma(jyz, jzz, vfma(jyy, jzy, vmul(jyx, jzx))));
+        WH[5] = vmul(sH, vfma(jzz, jzz, vfma(jzy, jzy, vmul(jzx, jzx))));
+
+        // element independent basis values (edgebasis_*, curl_edgebasis_*)
+        const Real_type s[EB] = {tmpyz, yloctmpz, tmpyzloc, yzloc,
+                                 tmpxz, xloctmpz, tmpxzloc, xzloc,
+                                 tmpxy, xloctmpy, tmpxyloc, xyloc};
+        const Real_type db[EB][3] = {
+          {0.0, -tmpy,  tmpz}, {0.0, -yloc, -tmpz},
+          {0.0,  tmpy,  zloc}, {0.0,  yloc, -zloc},
+          { tmpx, 0.0, -tmpz}, { xloc, 0.0,  tmpz},
+          {-tmpx, 0.0, -zloc}, {-xloc, 0.0,  zloc},
+          {-tmpx,  tmpy, 0.0}, {-xloc, -tmpy, 0.0},
+          { tmpx,  yloc, 0.0}, { xloc, -yloc, 0.0}};
+
+        // v_m = wbeta H db_m
+        alignas(64) vd v[EB][3];
+        RAJAPERF_FEM_UNROLL
+        for (Int_type m = 0; m < EB; m++) {
+          const Int_type a1 = nz1[m / 4], a2 = nz2[m / 4];
+          const vd b1 = vset1(db[m][a1]), b2 = vset1(db[m][a2]);
+          RAJAPERF_FEM_UNROLL
+          for (Int_type c = 0; c < 3; c++) {
+            v[m][c] = vfma(WH[sym[c][a2]], b2, vmul(WH[sym[c][a1]], b1));
+          }
+        }
+
+        Int_type u = 0;
+        RAJAPERF_FEM_UNROLL
+        for (Int_type p = 0; p < EB; p++) {
+          const Int_type gp = p / 4;
+          const Int_type a1 = nz1[gp], a2 = nz2[gp];
+          const vd sp = vset1(s[p]);
+          const vd ap[3] = {vmul(sp, WG[sym[gp][0]]), vmul(sp, WG[sym[gp][1]]),
+                            vmul(sp, WG[sym[gp][2]])};
+          const vd bp1 = vset1(db[p][a1]), bp2 = vset1(db[p][a2]);
+          RAJAPERF_FEM_UNROLL
+          for (Int_type m = p; m < EB; m++, u++) {
+            vd acc = vfma(vset1(s[m]), ap[m / 4], Mu[u]);
+            acc = vfma(bp1, v[m][a1], acc);
+            Mu[u] = vfma(bp2, v[m][a2], acc);
+          }
+        }
+      }
+    }
+  }
+
+  // sum of the full symmetric matrix
+  vd sdiag = vzero(), soff = vzero();
+  Int_type u = 0;
+  for (Int_type p = 0; p < EB; p++) {
+    sdiag = vadd(sdiag, Mu[u++]);
+    for (Int_type m = p + 1; m < EB; m++) {
+      soff = vadd(soff, Mu[u++]);
+    }
+  }
+  vstore(sum, lm, vfma(soff, vset1(2.0), sdiag));
+  // testing only: upper triangle as [NU][FEM_VL]
+  if constexpr (STORE_MATRIX) {
+    for (Int_type v = 0; v < NU; v++) {
+      vstore(matrix + v * FEM_VL, Mu[v]);
+    }
+  }
+}
+
+#define EDGE3D_METRIC_FN edge_MpSmatrix_sum_avx512
+#else
+#define EDGE3D_METRIC_FN edge_MpSmatrix_sum_simd
+#endif
+
+// "metric" tuning: batch [i0, min(i0+EDGE3D_VL, iend)) with the metric-tensor
+// reformulation; RAJAPerf's FLOP count still describes the reference algorithm.
+#define EDGE3D_METRIC_BODY \
+  {\
+    const rajaperf::Index_type nel_ = \
+      (iend - i0 < EDGE3D_VL) ? (iend - i0) : EDGE3D_VL;\
+    const rajaperf::Real_type *const xn_[NB] = \
+      {x0+i0, x1+i0, x2+i0, x3+i0, x4+i0, x5+i0, x6+i0, x7+i0};\
+    const rajaperf::Real_type *const yn_[NB] = \
+      {y0+i0, y1+i0, y2+i0, y3+i0, y4+i0, y5+i0, y6+i0, y7+i0};\
+    const rajaperf::Real_type *const zn_[NB] = \
+      {z0+i0, z1+i0, z2+i0, z3+i0, z4+i0, z5+i0, z6+i0, z7+i0};\
+    EDGE3D_METRIC_FN<NQ_1D>(xn_, yn_, zn_, nel_, 1.0, 1.0, 0.0, 1, sum + i0);\
+  }
+
 #define EDGE3D_DATA_SETUP \
   Real_ptr x = m_x; \
   Real_ptr y = m_y; \
@@ -739,6 +1194,7 @@ public:
   void defineSyclVariantTunings();
 
   void runSeqVariant(VariantID vid);
+  template < size_t tune_idx >
   void runOpenMPVariant(VariantID vid);
   void runOpenMPTargetVariant(VariantID vid);
 

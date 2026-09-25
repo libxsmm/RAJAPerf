@@ -21,6 +21,7 @@ namespace apps
 {
 
 
+template < size_t tune_idx >
 void EDGE3D::runOpenMPVariant(VariantID vid)
 {
 #if defined(RAJA_ENABLE_OPENMP) && defined(RUN_OPENMP)
@@ -31,9 +32,14 @@ void EDGE3D::runOpenMPVariant(VariantID vid)
 
   EDGE3D_DATA_SETUP;
 
+  // tune_idx 0: reference algorithm; 1: metric-tensor reformulation
   auto edge3d_lam =
     [=](Index_type i0) {
-      EDGE3D_SIMD_BODY;
+      if constexpr (tune_idx == 0) {
+        EDGE3D_SIMD_BODY;
+      } else {
+        EDGE3D_METRIC_BODY;
+      }
     };
 
   switch ( vid ) {
@@ -47,7 +53,11 @@ void EDGE3D::runOpenMPVariant(VariantID vid)
         RP_CALI_SUBKERNEL_BEGIN("EDGE3D_1");
         #pragma omp parallel for
         for (Index_type i0 = ibegin ; i0 < iend ; i0 += EDGE3D_VL ) {
-          EDGE3D_SIMD_BODY;
+          if constexpr (tune_idx == 0) {
+            EDGE3D_SIMD_BODY;
+          } else {
+            EDGE3D_METRIC_BODY;
+          }
         }
         RP_CALI_SUBKERNEL_END("EDGE3D_1");
 
@@ -106,7 +116,14 @@ void EDGE3D::runOpenMPVariant(VariantID vid)
 #endif
 }
 
-RAJAPERF_DEFAULT_TUNING_DEFINE_BOILERPLATE(EDGE3D, OpenMP, Base_OpenMP, Lambda_OpenMP, RAJA_OpenMP)
+void EDGE3D::defineOpenMPVariantTunings()
+{
+  for (VariantID vid : {Base_OpenMP, Lambda_OpenMP, RAJA_OpenMP}) {
+    addVariantTuning<&EDGE3D::runOpenMPVariant<0>>(vid, getDefaultTuningName());
+    // same result, fewer FLOPs than setFLOPsPerRep() counts (see EDGE3D_METRIC_BODY)
+    addVariantTuning<&EDGE3D::runOpenMPVariant<1>>(vid, "metric");
+  }
+}
 
 } // end namespace apps
 } // end namespace rajaperf

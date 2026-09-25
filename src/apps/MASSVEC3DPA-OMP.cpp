@@ -20,6 +20,8 @@ namespace rajaperf {
 namespace apps {
 
 
+// tune_idx 0: default; 1: AVX-512 batches with streaming stores of Y
+template <size_t tune_idx>
 void MASSVEC3DPA::runOpenMPVariant(VariantID vid)
 {
 
@@ -27,6 +29,55 @@ void MASSVEC3DPA::runOpenMPVariant(VariantID vid)
 
   const Index_type run_reps = getRunReps();
   MASSVEC3DPA_DATA_SETUP;
+
+#if defined(RAJAPERF_FEM_AVX512)
+  if constexpr (tune_idx == 1) {
+
+    switch (vid) {
+
+    case Base_OpenMP: {
+      startTimer();
+      // Loop counter increment uses macro to quiet C++20 compiler warning
+      for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
+        #pragma omp parallel
+        {
+          #pragma omp for nowait
+          for (Index_type e0 = 0; e0 < NE; e0 += FEM_VL) {
+            massvec3dpa_batch_avx512<true>(B, D, X, Y, e0,
+                                           (NE - e0 < FEM_VL) ? NE - e0 : FEM_VL);
+          }
+          fem_simd::stream_fence();
+        }
+      }
+      stopTimer();
+      break;
+    }
+
+    case RAJA_OpenMP: {
+      auto res{getHostResource()};
+      startTimer();
+      // Loop counter increment uses macro to quiet C++20 compiler warning
+      for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
+        RAJA::region<RAJA::omp_parallel_region>( [=]() {
+          RAJA::forall< RAJA::omp_for_nowait_static_exec< > >( res,
+            RAJA::RangeStrideSegment(0, NE, FEM_VL), [=](Index_type e0) {
+              massvec3dpa_batch_avx512<true>(B, D, X, Y, e0,
+                                             (NE - e0 < FEM_VL) ? NE - e0 : FEM_VL);
+            });
+          fem_simd::stream_fence();
+        });
+      }
+      stopTimer();
+      break;
+    }
+
+    default:
+      getCout() << "\n MASSVEC3DPA : Unknown OpenMP variant id = " << vid
+                << std::endl;
+    }
+    return;
+  }
+#endif
 
   switch (vid) {
 
@@ -40,6 +91,9 @@ RP_CALI_SUBKERNEL_BEGIN("MASSVEC3DPA_1");
 #pragma omp parallel for
       for (Index_type e0 = 0; e0 < NE; e0 += FEM_VL) {
 
+#if defined(RAJAPERF_FEM_AVX512)
+        MASSVEC3DPA_CPU_SIMD_BATCH
+#else
         MASSVEC3DPA_0_CPU_SIMD;
 
         SHARED_LOOP_2D(q, d, mvpa::Q1D, mvpa::D1D) {
@@ -78,6 +132,7 @@ RP_CALI_SUBKERNEL_BEGIN("MASSVEC3DPA_1");
           }
 
         } //(c) dimension loop
+#endif
 
       } // element loop
 RP_CALI_SUBKERNEL_END("MASSVEC3DPA_1");
@@ -95,11 +150,13 @@ RP_CALI_SUBKERNEL_END("MASSVEC3DPA_1");
 
     using outer_x = RAJA::LoopPolicy<RAJA::omp_for_exec>;
 
+#if !defined(RAJAPERF_FEM_AVX512)
     using inner_x = RAJA::LoopPolicy<RAJA::seq_exec>;
 
     using inner_y = RAJA::LoopPolicy<RAJA::seq_exec>;
 
     using inner_z = RAJA::LoopPolicy<RAJA::seq_exec>;
+#endif
 
     startTimer();
     // Loop counter increment uses macro to quiet C++20 compiler warning
@@ -115,6 +172,9 @@ RP_CALI_SUBKERNEL_END("MASSVEC3DPA_1");
           RAJA::loop<outer_x>(ctx, RAJA::RangeStrideSegment(0, NE, FEM_VL),
             [&](Index_type e0) {
 
+#if defined(RAJAPERF_FEM_AVX512)
+            MASSVEC3DPA_CPU_SIMD_BATCH
+#else
             MASSVEC3DPA_0_CPU_SIMD;
 
             //3 loops to remain consistent with the GPU versions
@@ -248,6 +308,7 @@ RP_CALI_SUBKERNEL_END("MASSVEC3DPA_1");
             ctx.teamSync();
 
             } // c - dim loop
+#endif
           }  // lambda (e)
          );  // RAJA::loop<outer_x>
         }  // outer lambda (ctx)
@@ -271,7 +332,15 @@ RP_CALI_SUBKERNEL_END("MASSVEC3DPA_1");
 #endif
 }
 
-RAJAPERF_DEFAULT_TUNING_DEFINE_BOILERPLATE(MASSVEC3DPA, OpenMP, Base_OpenMP, RAJA_OpenMP)
+void MASSVEC3DPA::defineOpenMPVariantTunings()
+{
+  for (VariantID vid : {Base_OpenMP, RAJA_OpenMP}) {
+    addVariantTuning<&MASSVEC3DPA::runOpenMPVariant<0>>(vid, getDefaultTuningName());
+#if defined(RAJAPERF_FEM_AVX512)
+    addVariantTuning<&MASSVEC3DPA::runOpenMPVariant<1>>(vid, "nt");
+#endif
+  }
+}
 
 } // end namespace apps
 } // end namespace rajaperf

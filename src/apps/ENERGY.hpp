@@ -177,6 +177,78 @@
      if (fabs(q_new[i]) < q_cut) q_new[i] = 0.0 ; \
   }
 
+// ENERGY_BODY1..6 for one i in a single pass (all six loops are element-wise,
+// so fusion is exact); each input is read once, e_new/q_new written once.
+#define ENERGY_FUSED_COMPUTE(en, qn) \
+  Real_type en, qn; \
+  { \
+    const Real_type dv = delvc[i]; \
+    const Real_type pq_old = p_old[i] + q_old[i]; \
+    const Real_type phs = pHalfStep[i]; \
+    const Real_type hwork = 0.5 * work[i]; \
+    const Real_type pbv = pbvc[i]; \
+    const Real_type qlo = ql_old[i]; \
+    const Real_type qqo = qq_old[i]; \
+    const Real_type vnb = vnewc[i] * vnewc[i] * bvc[i] * p_new[i]; \
+    en = e_old[i] - 0.5 * dv * pq_old + hwork; \
+    if ( dv > 0.0 ) { \
+      qn = 0.0; \
+    } else { \
+      const Real_type vhalf = 1.0 / (1.0 + compHalfStep[i]); \
+      Real_type ssc = ( pbv * en + vhalf * vhalf * bvc[i] * phs ) / rho0; \
+      ssc = ( ssc <= 0.1111111e-36 ) ? 0.3333333e-18 : sqrt(ssc); \
+      qn = ssc * qlo + qqo; \
+    } \
+    en = en + 0.5 * dv * ( 3.0 * pq_old - 4.0 * (phs + qn) ); \
+    en += hwork; \
+    if ( fabs(en) < e_cut ) { en = 0.0; } \
+    if ( en < emin ) { en = emin; } \
+    Real_type q_tilde; \
+    if ( dv > 0.0 ) { \
+      q_tilde = 0.0; \
+    } else { \
+      Real_type ssc = ( pbv * en + vnb ) / rho0; \
+      ssc = ( ssc <= 0.1111111e-36 ) ? 0.3333333e-18 : sqrt(ssc); \
+      q_tilde = ssc * qlo + qqo; \
+    } \
+    en = en - ( 7.0 * pq_old - 8.0 * (phs + qn) + (p_new[i] + q_tilde) ) * dv / 6.0; \
+    if ( fabs(en) < e_cut ) { en = 0.0; } \
+    if ( en < emin ) { en = emin; } \
+    if ( dv <= 0.0 ) { \
+      Real_type ssc = ( pbv * en + vnb ) / rho0; \
+      ssc = ( ssc <= 0.1111111e-36 ) ? 0.3333333e-18 : sqrt(ssc); \
+      qn = ssc * qlo + qqo; \
+      if ( fabs(qn) < q_cut ) { qn = 0.0; } \
+    } \
+  }
+
+#include "FEM_SIMD.hpp"
+
+constexpr rajaperf::Index_type ENERGY_TILE = 256;
+
+// Tile [t, t+ENERGY_TILE) of the fused kernel, results staged in L1 so full
+// aligned tiles can be written with streaming stores when STREAM is true.
+#define ENERGY_FUSED_TILE(t, STREAM) \
+  { \
+    const Index_type tend_ = ((t) + ENERGY_TILE < iend) ? (t) + ENERGY_TILE : iend; \
+    alignas(64) Real_type en_t[ENERGY_TILE]; \
+    alignas(64) Real_type qn_t[ENERGY_TILE]; \
+    FEM_OMP_SIMD \
+    for (Index_type i = (t); i < tend_; ++i) { \
+      ENERGY_FUSED_COMPUTE(en, qn); \
+      en_t[i - (t)] = en; \
+      qn_t[i - (t)] = qn; \
+    } \
+    if ((STREAM) && nt_ok && tend_ - (t) == ENERGY_TILE) { \
+      fem_simd::stream_copy(e_new + (t), en_t, ENERGY_TILE); \
+      fem_simd::stream_copy(q_new + (t), qn_t, ENERGY_TILE); \
+    } else { \
+      for (Index_type i = (t); i < tend_; ++i) { \
+        e_new[i] = en_t[i - (t)]; \
+        q_new[i] = qn_t[i - (t)]; \
+      } \
+    } \
+  }
 
 #include "common/KernelBase.hpp"
 
@@ -208,7 +280,9 @@ public:
   void defineSyclVariantTunings();
 
   void runSeqVariant(VariantID vid);
+  template < size_t tune_idx >
   void runOpenMPVariant(VariantID vid);
+  void runOpenMPVariantReference(VariantID vid);
   void runOpenMPTargetVariant(VariantID vid);
 
   template < size_t block_size >

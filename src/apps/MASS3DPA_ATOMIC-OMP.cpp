@@ -55,6 +55,9 @@ RP_CALI_SUBKERNEL_BEGIN("MASS3DPA_ATOMIC_1");
       const Index_type rend = Nx * (ey + Ny * ez) + Nx;
       for (Index_type e0 = rend - Nx; e0 < rend; e0 += FEM_VL) {
 
+#if defined(RAJAPERF_FEM_AVX512)
+        mass3dpa_atomic_batch_avx512(B, D, X, Y, ElemToDoF, e0, rend);
+#else
         MASS3DPA_ATOMIC_0_CPU_SIMD(e0, rend);
 
         SHARED_LOOP_3D(dx, dy, dz, mpa_at::D1D, mpa_at::D1D, mpa_at::D1D) {
@@ -89,6 +92,7 @@ RP_CALI_SUBKERNEL_BEGIN("MASS3DPA_ATOMIC_1");
           MASS3DPA_ATOMIC_SIMD_8;
           MASS3DPA_ATOMIC_SIMD_9;
         }
+#endif
 
       } // element batch loop
       } // ey
@@ -110,11 +114,13 @@ RP_CALI_SUBKERNEL_END("MASS3DPA_ATOMIC_1");
 
     using outer_x = RAJA::LoopPolicy<RAJA::omp_for_exec>;
 
+#if !defined(RAJAPERF_FEM_AVX512)
     using inner_x = RAJA::LoopPolicy<RAJA::seq_exec>;
 
     using inner_y = RAJA::LoopPolicy<RAJA::seq_exec>;
 
     using inner_z = RAJA::LoopPolicy<RAJA::seq_exec>;
+#endif
 
     startTimer();
     // Loop counter increment uses macro to quiet C++20 compiler warning
@@ -139,6 +145,9 @@ RP_CALI_SUBKERNEL_END("MASS3DPA_ATOMIC_1");
            const Index_type rend = Nx * (ey + Ny * ez) + Nx;
            for (Index_type e0 = rend - Nx; e0 < rend; e0 += FEM_VL) {
 
+#if defined(RAJAPERF_FEM_AVX512)
+            mass3dpa_atomic_batch_avx512(B, D, X, Y, ElemToDoF, e0, rend);
+#else
             MASS3DPA_ATOMIC_0_CPU_SIMD(e0, rend);
 
             RAJA::loop<inner_z>(ctx, RAJA::RangeSegment(0, mpa_at::D1D),
@@ -260,6 +269,7 @@ RP_CALI_SUBKERNEL_END("MASS3DPA_ATOMIC_1");
                 ); // RAJA::loop<inner_y>
               } // lambda (dz)
             ); // RAJA::loop<inner_z>
+#endif
 
            } // e0
            } // ey

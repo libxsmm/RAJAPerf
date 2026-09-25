@@ -80,9 +80,9 @@ MASSVEC3DPA::~MASSVEC3DPA() {}
 void MASSVEC3DPA::setUp(VariantID vid, size_t RAJAPERF_UNUSED_ARG(tune_idx))
 {
 
-  allocAndInitDataConst(m_B, mvpa::Q1D*mvpa::D1D, 1.0, vid);
-  allocAndInitDataConst(m_D, mvpa::Q1D*mvpa::Q1D*mvpa::Q1D*m_NE, 1.0, vid);
-  allocAndInitDataConst(m_X, mvpa::D1D*mvpa::D1D*mvpa::D1D*mvpa::DIM*m_NE, 1.0, vid);
+  allocAndInitDataRandValue(m_B, mvpa::Q1D*mvpa::D1D, vid);
+  allocAndInitDataRandValue(m_D, mvpa::Q1D*mvpa::Q1D*mvpa::Q1D*m_NE, vid);
+  allocAndInitDataRandValue(m_X, mvpa::D1D*mvpa::D1D*mvpa::D1D*mvpa::DIM*m_NE, vid);
   allocAndInitDataConst(m_Y, mvpa::D1D*mvpa::D1D*mvpa::D1D*mvpa::DIM*m_NE, 0.0, vid);
 
 }

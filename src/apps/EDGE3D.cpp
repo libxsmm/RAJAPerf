@@ -102,6 +102,18 @@ void EDGE3D::setUp(VariantID vid, size_t RAJAPERF_UNUSED_ARG(tune_idx))
   Real_type dz = 0.1;
   setMeshPositions_3d(m_x, dx, m_y, dy, m_z, dz, *m_domain);
 
+  // perturb nodes (+-15% of the spacing) so element Jacobians are non-diagonal
+  for (Index_type i = 0; i < m_array_length; ++i) {
+    auto h = [i](unsigned c) {
+      unsigned long long s = (static_cast<unsigned long long>(i) + 1) * 0x9E3779B97F4A7C15ull + c;
+      s ^= s >> 31; s *= 0xBF58476D1CE4E5B9ull; s ^= s >> 29;
+      return 0.3 * (static_cast<Real_type>(s >> 11) / 9007199254740992.0 - 0.5);
+    };
+    m_x[i] += dx * h(1);
+    m_y[i] += dy * h(2);
+    m_z[i] += dz * h(3);
+  }
+
   allocAndInitDataConst(m_sum, m_array_length, Real_type(0.0), vid);
 }
 

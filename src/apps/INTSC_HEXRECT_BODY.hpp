@@ -569,6 +569,258 @@ RAJA_INLINE Int_type intsc24_hex
   return vtxcnt ;
 }
 
+
+//  ---------------------------------------------------------------------------
+//  Plane-splitting variant: one donor hexahedron against its 2x2x2 block of
+//  target zones in one pass.  Each facet is split once by the shared x, y
+//  and z planes (instead of being clipped against six planes per target),
+//  and the pieces are integrated exactly as in intsc24_hex.
+//  ---------------------------------------------------------------------------
+
+struct IntscPoly
+{
+  static constexpr Int_type cap = 16 ;   // triangle clipped by <= 8 planes
+  Real_type c[3][cap] ;                  // x, y, z coordinates
+  Int_type n = 0 ;
+} ;
+
+//   Split polygon p by plane c[axis] = cut into lo (< cut) and hi (>= cut),
+//   using one shared intersection vertex for both halves.
+RAJA_INLINE void intsc_split_polygon
+    ( IntscPoly const& p, Int_type const axis, Real_type const cut,
+      IntscPoly& lo, IntscPoly& hi )
+{
+  lo.n = hi.n = 0 ;
+  for ( Int_type k = 0 ; k < p.n ; ++k ) {
+    Int_type const j = ( k + 1 == p.n ) ? 0 : k + 1 ;
+    Real_type const a = p.c[axis][k], b = p.c[axis][j] ;
+    bool const alo = a < cut, blo = b < cut ;
+    IntscPoly& side = alo ? lo : hi ;
+    for ( Int_type d = 0 ; d < 3 ; ++d ) { side.c[d][side.n] = p.c[d][k] ; }
+    ++side.n ;
+    if ( alo != blo ) {
+      Real_type const eta = ( cut - a ) / ( b - a ) ;
+      for ( Int_type d = 0 ; d < 3 ; ++d ) {
+        Real_type const v = ( d == axis ) ? cut
+                          : p.c[d][k] + ( p.c[d][j] - p.c[d][k] ) * eta ;
+        lo.c[d][lo.n] = v ;  hi.c[d][hi.n] = v ;
+      }
+      ++lo.n ;  ++hi.n ;
+    }
+  }
+}
+
+//   Keep only the part of p with c[axis] >= cut (KEEP_HI) or < cut.
+template < bool KEEP_HI >
+RAJA_INLINE void intsc_clip_polygon
+    ( IntscPoly& p, Int_type const axis, Real_type const cut )
+{
+  IntscPoly lo, hi ;
+  intsc_split_polygon( p, axis, cut, lo, hi ) ;
+  p = KEEP_HI ? hi : lo ;
+}
+
+//   Split p like intsc_split_polygon, but pass p through uncopied if it lies
+//   on one side; lo/hi point to p, to slo/shi, or are null when empty.
+RAJA_INLINE void intsc_split_or_pass
+    ( IntscPoly const& p, Int_type const axis, Real_type const cut,
+      IntscPoly& slo, IntscPoly& shi,
+      IntscPoly const*& lo, IntscPoly const*& hi )
+{
+  lo = hi = nullptr ;
+  if ( p.n < 3 ) { return ; }
+  Real_type mn = p.c[axis][0], mx = mn ;
+  for ( Int_type k = 1 ; k < p.n ; ++k ) {
+    mn = ( p.c[axis][k] < mn ) ? p.c[axis][k] : mn ;
+    mx = ( p.c[axis][k] > mx ) ? p.c[axis][k] : mx ;
+  }
+  if ( mx < cut )  { lo = &p ; return ; }
+  if ( mn >= cut ) { hi = &p ; return ; }
+  intsc_split_polygon( p, axis, cut, slo, shi ) ;
+  lo = ( slo.n >= 3 ) ? &slo : nullptr ;
+  hi = ( shi.n >= 3 ) ? &shi : nullptr ;
+}
+
+//   Add the column integral of polygon p (already inside the target's xy
+//   extent) over the target frame to the sums; heights are z - zt0, or dzt
+//   for a polygon projected to the target's top (PROJECT).
+template < bool PROJECT >
+RAJA_INLINE void intsc_add_polygon
+    ( IntscPoly const& p,
+      Real_type const xt0, Real_type const dtx, Real_type const a11,
+      Real_type const yt0, Real_type const dty, Real_type const a22,
+      Real_type const zt0, Real_type const dzt,
+      Real_type (&sums)[4] )
+{
+  if ( p.n < 3 ) { return ; }
+  Real_type q[ 3*max_polygon_pts ] ;
+  for ( Int_type k = 0 ; k < p.n ; ++k ) {
+    q[k]                     = ( p.c[0][k] - xt0 ) * a11 ;
+    q[k + max_polygon_pts]   = ( p.c[1][k] - yt0 ) * a22 ;
+    q[k + 2*max_polygon_pts] = PROJECT ? dzt : p.c[2][k] - zt0 ;
+  }
+  Real_type asum0 = 0.0, asumx = 0.0, asumy = 0.0, asumz = 0.0 ;
+  intsc24_shxf1( dtx, dty, xt0, yt0, zt0, q, p.n, asum0, asumx, asumy, asumz ) ;
+  Real_type const det = dtx * dty ;
+  sums[0] += asum0 * det ;
+  sums[1] += asumx * det ;
+  sums[2] += asumy * det ;
+  sums[3] += asumz * det ;
+}
+
+//   Volume and moments of one donor hexahedron intersected with the 2x2x2
+//   target zones bounded by planes xp[0..2], yp[0..2], zp[0..2].
+//   out[r][0..3] for target r = ix + 2*iy + 4*iz.
+RAJA_INLINE void intsc24_hex_split8
+      ( Real_const_ptr xd, Real_const_ptr yd, Real_const_ptr zd,  // [8] donor
+        Real_const_ptr xp, Real_const_ptr yp, Real_const_ptr zp,  // [3] planes
+        Real_type (&out)[8][4] )
+{
+  for ( Int_type r = 0 ; r < 8 ; ++r ) {
+    out[r][0] = out[r][1] = out[r][2] = out[r][3] = 0.0 ;
+  }
+
+  // per-target frame factors, as in intsc24_hex
+  Real_type dtx[2], dty[2], dzt[2], a11[2][2], a22[2][2] ;
+  for ( Int_type k = 0 ; k < 2 ; ++k ) {
+    dtx[k] = xp[k+1] - xp[k] ;
+    dty[k] = yp[k+1] - yp[k] ;
+    dzt[k] = ( zp[k+1] > zp[k] ) ? ( zp[k+1] - zp[k] ) : 0.0 ;
+  }
+  for ( Int_type ix = 0 ; ix < 2 ; ++ix ) {
+    for ( Int_type iy = 0 ; iy < 2 ; ++iy ) {
+      Real_type const det = dtx[ix] * dty[iy] ;
+      Real_type const deti = det / ( det*det + 1.0e-80 ) ;
+      a11[ix][iy] = dty[iy] * deti ;
+      a22[ix][iy] = dtx[ix] * deti ;
+    }
+  }
+
+  static constexpr Int_type vface[6][4] =
+    { {0, 2, 6, 4}, {1, 5, 7, 3}, {0, 4, 5, 1},
+      {2, 3, 7, 6}, {0, 1, 3, 2}, {4, 6, 7, 5} } ;
+
+  for ( Int_type f = 0 ; f < 6 ; ++f ) {
+    Int_type const* v = vface[f] ;
+    Real_type const fx = 0.25 * ( xd[v[0]] + xd[v[1]] + xd[v[2]] + xd[v[3]] ) ;
+    Real_type const fy = 0.25 * ( yd[v[0]] + yd[v[1]] + yd[v[2]] + yd[v[3]] ) ;
+    Real_type const fz = 0.25 * ( zd[v[0]] + zd[v[1]] + zd[v[2]] + zd[v[3]] ) ;
+
+    for ( Int_type k0 = 0 ; k0 < 4 ; ++k0 ) {
+      Int_type const vv0 = v[k0], vv2 = v[(k0 + 1) & 3] ;
+
+      // facet (vv0, face center, vv2), same orientation as intsc24_hex_get_tri
+      IntscPoly tri ;
+      tri.n = 3 ;
+      tri.c[0][0] = xd[vv0] ;  tri.c[0][1] = fx ;  tri.c[0][2] = xd[vv2] ;
+      tri.c[1][0] = yd[vv0] ;  tri.c[1][1] = fy ;  tri.c[1][2] = yd[vv2] ;
+      tri.c[2][0] = zd[vv0] ;  tri.c[2][1] = fz ;  tri.c[2][2] = zd[vv2] ;
+
+      Real_type lo[3], hi[3] ;
+      for ( Int_type d = 0 ; d < 3 ; ++d ) {
+        lo[d] = hi[d] = tri.c[d][0] ;
+        for ( Int_type k = 1 ; k < 3 ; ++k ) {
+          lo[d] = ( tri.c[d][k] < lo[d] ) ? tri.c[d][k] : lo[d] ;
+          hi[d] = ( tri.c[d][k] > hi[d] ) ? tri.c[d][k] : hi[d] ;
+        }
+      }
+      // facet outside the block's xy extent or below it contributes nothing
+      if ( hi[0] < xp[0] || lo[0] >= xp[2] || hi[1] < yp[0] || lo[1] >= yp[2] ||
+           hi[2] < zp[0] ) {
+        continue ;
+      }
+      if ( lo[0] < xp[0] )  { intsc_clip_polygon<true >( tri, 0, xp[0] ) ; }
+      if ( hi[0] >= xp[2] ) { intsc_clip_polygon<false>( tri, 0, xp[2] ) ; }
+      if ( lo[1] < yp[0] )  { intsc_clip_polygon<true >( tri, 1, yp[0] ) ; }
+      if ( hi[1] >= yp[2] ) { intsc_clip_polygon<false>( tri, 1, yp[2] ) ; }
+
+      IntscPoly sx[2] ;
+      IntscPoly const* px[2] ;
+      intsc_split_or_pass( tri, 0, xp[1], sx[0], sx[1], px[0], px[1] ) ;
+
+      for ( Int_type ix = 0 ; ix < 2 ; ++ix ) {
+        if ( px[ix] == nullptr ) { continue ; }
+        IntscPoly sy[2] ;
+        IntscPoly const* pxy[2] ;
+        intsc_split_or_pass( *px[ix], 1, yp[1], sy[0], sy[1], pxy[0], pxy[1] ) ;
+
+        for ( Int_type iy = 0 ; iy < 2 ; ++iy ) {
+          if ( pxy[iy] == nullptr ) { continue ; }
+          Real_type const ax = a11[ix][iy], ay = a22[ix][iy] ;
+
+          // split at the shared z plane: pa below, pb above
+          IntscPoly sa, sb ;
+          IntscPoly const *pa, *pb ;
+          intsc_split_or_pass( *pxy[iy], 2, zp[1], sa, sb, pa, pb ) ;
+
+          // lower target: pa above zp[0] (central), pb projected to its top
+          Real_type (&s0)[4] = out[ix + 2*iy] ;
+          if ( pa != nullptr ) {
+            IntscPoly sl, sh ;
+            IntscPoly const *pl, *ph ;
+            intsc_split_or_pass( *pa, 2, zp[0], sl, sh, pl, ph ) ;
+            if ( ph != nullptr ) {
+              intsc_add_polygon<false>( *ph, xp[ix], dtx[ix], ax, yp[iy], dty[iy], ay,
+                                        zp[0], dzt[0], s0 ) ;
+            }
+          }
+          if ( pb != nullptr ) {
+            intsc_add_polygon<true>( *pb, xp[ix], dtx[ix], ax, yp[iy], dty[iy], ay,
+                                     zp[0], dzt[0], s0 ) ;
+
+            // upper target: pb below zp[2] (central), above it projected
+            Real_type (&s1)[4] = out[ix + 2*iy + 4] ;
+            IntscPoly sc, su ;
+            IntscPoly const *pc, *pu ;
+            intsc_split_or_pass( *pb, 2, zp[2], sc, su, pc, pu ) ;
+            if ( pc != nullptr ) {
+              intsc_add_polygon<false>( *pc, xp[ix], dtx[ix], ax, yp[iy], dty[iy], ay,
+                                        zp[1], dzt[1], s1 ) ;
+            }
+            if ( pu != nullptr ) {
+              intsc_add_polygon<true>( *pu, xp[ix], dtx[ix], ax, yp[iy], dty[iy], ay,
+                                       zp[1], dzt[1], s1 ) ;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+//   One donor zone (records 8*dz .. 8*dz+7, targets in the order of
+//   INTSC_HEXRECT::setupIntscPairs) with the plane-splitting algorithm.
+#define INTSC_HEXRECT_SPLIT_BODY(dz) \
+  { \
+    Index_type const irec0 = 8 * (dz) ; \
+    Real_type xd[8], yd[8], zd[8] ; \
+    { \
+      Int_type const dzone = intsc_d[irec0] ; \
+      for ( Index_type j = 0 ; j < 8 ; j++ ) { \
+        Int_type const node = znlist[ 8*dzone + j ] ; \
+        xd[j] = xdnode[node] ; \
+        yd[j] = ydnode[node] ; \
+        zd[j] = zdnode[node] ; \
+      } \
+    } \
+    auto plane = reinterpret_cast<typename INTSC_HEXRECT::Plane*>(ncord_gpu) ; \
+    Int_type const nyzones = plane->ncord[1] ; \
+    Int_type const nxzones = plane->ncord[2] ; \
+    Int_type const tz = intsc_t[irec0] ; \
+    Int_type const jz = tz / ( nxzones * nyzones ) ; \
+    Int_type const jy = ( tz / nxzones ) % nyzones ; \
+    Int_type const jx = tz % nxzones ; \
+    Real_type out[8][4] ; \
+    intsc24_hex_split8( xd, yd, zd, plane->planes[2] + jx, plane->planes[1] + jy, \
+                        plane->planes[0] + jz, out ) ; \
+    Real_ptr record = records + 4 * irec0 ; \
+    for ( Index_type r = 0 ; r < 8 ; ++r ) { \
+      for ( Index_type v = 0 ; v < 4 ; ++v ) { \
+        record[4*r + v] = out[r][v] ; \
+      } \
+    } \
+  }
+
 }  // end namespace rajaperf
 
 

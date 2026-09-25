@@ -19,7 +19,7 @@ namespace apps
 {
 
 
-void ENERGY::runOpenMPVariant(VariantID vid)
+void ENERGY::runOpenMPVariantReference(VariantID vid)
 {
 #if defined(RAJA_ENABLE_OPENMP) && defined(RUN_OPENMP)
 
@@ -224,7 +224,122 @@ void ENERGY::runOpenMPVariant(VariantID vid)
 #endif
 }
 
-RAJAPERF_DEFAULT_TUNING_DEFINE_BOILERPLATE(ENERGY, OpenMP, Base_OpenMP, Lambda_OpenMP, RAJA_OpenMP)
+// tune_idx 0: reference (six loops); 1: fused single pass; 2: fused with
+// streaming (non-temporal) stores of e_new and q_new
+template < size_t tune_idx >
+void ENERGY::runOpenMPVariant(VariantID vid)
+{
+#if defined(RAJA_ENABLE_OPENMP) && defined(RUN_OPENMP)
 
+  if constexpr (tune_idx == 0) {
+    runOpenMPVariantReference(vid);
+  } else {
+
+  constexpr bool stream = (tune_idx == 2);
+  const Index_type run_reps = getRunReps();
+  const Index_type ibegin = 0;
+  const Index_type iend = getActualProblemSize();
+
+  ENERGY_DATA_SETUP;
+
+  const bool nt_ok = fem_simd::is_aligned64(e_new) && fem_simd::is_aligned64(q_new);
+
+  auto energy_tile_lam = [=](Index_type t) {
+                           ENERGY_FUSED_TILE(t, stream);
+                         };
+
+  switch ( vid ) {
+
+    case Base_OpenMP : {
+
+      startTimer();
+      // Loop counter increment uses macro to quiet C++20 compiler warning
+      for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
+
+        #pragma omp parallel
+        {
+          RP_CALI_SUBKERNEL_BEGIN("ENERGY_FUSED");
+          #pragma omp for schedule(static) nowait
+          for (Index_type t = ibegin; t < iend; t += ENERGY_TILE ) {
+            ENERGY_FUSED_TILE(t, stream);
+          }
+          if (stream) { fem_simd::stream_fence(); }
+          RP_CALI_SUBKERNEL_END("ENERGY_FUSED");
+        }
+
+      }
+      stopTimer();
+
+      break;
+    }
+
+    case Lambda_OpenMP : {
+
+      startTimer();
+      // Loop counter increment uses macro to quiet C++20 compiler warning
+      for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
+
+        #pragma omp parallel
+        {
+          RP_CALI_SUBKERNEL_BEGIN("ENERGY_FUSED");
+          #pragma omp for schedule(static) nowait
+          for (Index_type t = ibegin; t < iend; t += ENERGY_TILE ) {
+            energy_tile_lam(t);
+          }
+          if (stream) { fem_simd::stream_fence(); }
+          RP_CALI_SUBKERNEL_END("ENERGY_FUSED");
+        }
+
+      }
+      stopTimer();
+
+      break;
+    }
+
+    case RAJA_OpenMP : {
+
+      auto res{getHostResource()};
+
+      startTimer();
+      // Loop counter increment uses macro to quiet C++20 compiler warning
+      for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
+
+        RAJA::region<RAJA::omp_parallel_region>( [=]() {
+          RP_CALI_SUBKERNEL_BEGIN("ENERGY_FUSED");
+          RAJA::forall< RAJA::omp_for_nowait_static_exec< > >( res,
+            RAJA::RangeStrideSegment(ibegin, iend, ENERGY_TILE), energy_tile_lam);
+          if (stream) { fem_simd::stream_fence(); }
+          RP_CALI_SUBKERNEL_END("ENERGY_FUSED");
+        });
+
+      }
+      stopTimer();
+      break;
+    }
+
+    default : {
+      getCout() << "\n  ENERGY : Unknown variant id = " << vid << std::endl;
+    }
+
+  }
+
+  }
+
+#else
+  RAJA_UNUSED_VAR(vid);
+#endif
+}
+
+void ENERGY::defineOpenMPVariantTunings()
+{
+  for (VariantID vid : {Base_OpenMP, Lambda_OpenMP, RAJA_OpenMP}) {
+    addVariantTuning<&ENERGY::runOpenMPVariant<0>>(vid, getDefaultTuningName());
+    // same result; fewer bytes moved than setBytes*PerRep() count
+    addVariantTuning<&ENERGY::runOpenMPVariant<1>>(vid, "fused");
+#if defined(RAJAPERF_FEM_AVX512)
+    addVariantTuning<&ENERGY::runOpenMPVariant<2>>(vid, "fused_nt");
+#endif
+  }
+}
 } // end namespace apps
 } // end namespace rajaperf
