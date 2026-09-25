@@ -32,6 +32,8 @@ void FEMSWEEP::runOpenMPVariant(VariantID vid)
 
   FEMSWEEP_DATA_SETUP;
 
+  const Index_type nbg = (ng + FEM_VL - 1) / FEM_VL;
+
   switch ( vid ) {
 
     case Base_OpenMP : {
@@ -44,23 +46,23 @@ RP_CALI_SUBKERNEL_BEGIN("FEMSWEEP_1");
 #if defined(USE_OMP_COLLAPSE)
         #pragma omp parallel for collapse(2)
         for (Index_type a = 0; a < na; ++a)
-        for (Index_type g = 0; g < ng; ++g)
+        for (Index_type g0 = 0; g0 < ng; g0 += FEM_VL)
         {
 #else
         #pragma omp parallel for
-        for (Index_type ag = 0; ag < na * ng; ++ag)
+        for (Index_type ag = 0; ag < na * nbg; ++ag)
         {
-            const Index_type a = ag / ng;
-            const Index_type g = ag % ng;
+            const Index_type a = ag / nbg;
+            const Index_type g0 = (ag % nbg) * FEM_VL;
 #endif
-            FEMSWEEP_KERNEL_SETUP;
+            FEMSWEEP_KERNEL_SETUP_SIMD;
             Index_type nehp_pos = 0;
             for (Index_type hp = 0; hp < nhp; ++hp)
             {
               const Index_type nehp = phpaa_r[ohp + hp];
               for (Index_type k = 0; k < nehp; ++k)
               {
-                FEMSWEEP_KERNEL_HYPERPLANE_ELEMENT;
+                FEMSWEEP_KERNEL_HYPERPLANE_ELEMENT_SIMD;
               }
               nehp_pos += nehp;
             }
@@ -96,18 +98,18 @@ RP_CALI_SUBKERNEL_END("FEMSWEEP_1");
         RAJA::launch<launch_policy>( res,
             RAJA::LaunchParams(),
             [=] RAJA_HOST_DEVICE(RAJA::LaunchContext ctx) {
-          RAJA::loop<outer_xy>(ctx, RAJA::RangeSegment(0, na * ng),
+          RAJA::loop<outer_xy>(ctx, RAJA::RangeSegment(0, na * nbg),
               [&](Index_type ag) {
-            const Index_type a = ag / ng;
-            const Index_type g = ag % ng;
-            FEMSWEEP_KERNEL_SETUP;
+            const Index_type a = ag / nbg;
+            const Index_type g0 = (ag % nbg) * FEM_VL;
+            FEMSWEEP_KERNEL_SETUP_SIMD;
             Index_type nehp_pos = 0;
             for (Index_type hp = 0; hp < nhp; ++hp)
             {
               const Index_type nehp = phpaa_r[ohp + hp];
               RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, nehp),
                   [&](Index_type k) {
-                FEMSWEEP_KERNEL_HYPERPLANE_ELEMENT;
+                FEMSWEEP_KERNEL_HYPERPLANE_ELEMENT_SIMD;
               });  // k loop
               ctx.teamSync();
               nehp_pos += nehp;

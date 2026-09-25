@@ -255,6 +255,99 @@ constexpr RAJA::Index_type Q1D = 4;
 #define MASS3DPA_ATOMIC_9(atomicAdd)                                           \
   atomicAdd(Y[thread_dofs[j]], u); // atomic add
 
+//
+// CPU SoA variant: batch of FEM_VL elements starting at e0, element innermost.
+// Stage 2 (basis load) is element independent and reused as is.
+//
+#define MASS3DPA_ATOMIC_0_CPU_SIMD                                             \
+  constexpr Index_type MQ1 = mpa_at::Q1D;                                      \
+  constexpr Index_type MD1 = mpa_at::D1D;                                      \
+  constexpr Index_type MDQ = (MQ1 > MD1) ? MQ1 : MD1;                          \
+  constexpr Index_type VL = FEM_VL;                                            \
+  FEM_BATCH_SETUP(e0, NE);                                                     \
+  Real_type sm_B[MQ1][MD1];                                                    \
+  Real_type sm_Bt[MD1][MQ1];                                                   \
+  Real_type sm0[MDQ * MDQ * MDQ][VL];                                          \
+  Real_type sm1[MDQ * MDQ * MDQ][VL];                                          \
+  Real_type(*sm_X)[MD1][MD1][VL] = (Real_type(*)[MD1][MD1][VL])sm0;            \
+  Real_type(*DDQ)[MD1][MQ1][VL] = (Real_type(*)[MD1][MQ1][VL])sm1;             \
+  Real_type(*DQQ)[MQ1][MQ1][VL] = (Real_type(*)[MQ1][MQ1][VL])sm0;             \
+  Real_type(*QQQ)[MQ1][MQ1][VL] = (Real_type(*)[MQ1][MQ1][VL])sm1;             \
+  Real_type(*QQD)[MQ1][MD1][VL] = (Real_type(*)[MQ1][MD1][VL])sm0;             \
+  Real_type(*QDD)[MD1][MD1][VL] = (Real_type(*)[MD1][MD1][VL])sm1;             \
+  Index_type thread_dofs[MD1 * MD1 * MD1][VL];
+
+// gather AoS -> SoA through ElemToDoF
+#define MASS3DPA_ATOMIC_SIMD_1                                                 \
+  const Index_type j = dx + mpa_at::D1D * (dy + dz * mpa_at::D1D);             \
+  CPU_FOREACH_LANE(l) {                                                        \
+    thread_dofs[j][l] =                                                        \
+        ElemToDoF[j + mpa_at::D1D * mpa_at::D1D * mpa_at::D1D * le[l]];        \
+    sm_X[dz][dy][dx][l] = X[thread_dofs[j][l]];                                \
+  }
+
+#define MASS3DPA_ATOMIC_SIMD_3                                                 \
+  CPU_FOREACH_LANE(l) {                                                        \
+    Real_type u = 0.0;                                                         \
+    for (Index_type dx = 0; dx < mpa_at::D1D; ++dx) {                          \
+      u += sm_X[dz][dy][dx][l] * sm_B[qx][dx];                                 \
+    }                                                                          \
+    DDQ[dz][dy][qx][l] = u;                                                    \
+  }
+
+#define MASS3DPA_ATOMIC_SIMD_4                                                 \
+  CPU_FOREACH_LANE(l) {                                                        \
+    Real_type u = 0.0;                                                         \
+    for (Index_type dy = 0; dy < mpa_at::D1D; ++dy) {                          \
+      u += DDQ[dz][dy][qx][l] * sm_B[qy][dy];                                  \
+    }                                                                          \
+    DQQ[dz][qy][qx][l] = u;                                                    \
+  }
+
+#define MASS3DPA_ATOMIC_SIMD_5                                                 \
+  CPU_FOREACH_LANE(l) {                                                        \
+    Real_type u = 0.0;                                                         \
+    for (Index_type dz = 0; dz < mpa_at::D1D; ++dz) {                          \
+      u += DQQ[dz][qy][qx][l] * sm_B[qz][dz];                                  \
+    }                                                                          \
+    QQQ[qz][qy][qx][l] = u * MPAT_D(qx, qy, qz, le[l]);                        \
+  }
+
+#define MASS3DPA_ATOMIC_SIMD_6                                                 \
+  CPU_FOREACH_LANE(l) {                                                        \
+    Real_type u = 0.0;                                                         \
+    for (Index_type qx = 0; qx < mpa_at::Q1D; ++qx) {                          \
+      u += QQQ[qz][qy][qx][l] * sm_Bt[dx][qx];                                 \
+    }                                                                          \
+    QQD[qz][qy][dx][l] = u;                                                    \
+  }
+
+#define MASS3DPA_ATOMIC_SIMD_7                                                 \
+  CPU_FOREACH_LANE(l) {                                                        \
+    Real_type u = 0.0;                                                         \
+    for (Index_type qy = 0; qy < mpa_at::Q1D; ++qy) {                          \
+      u += QQD[qz][qy][dx][l] * sm_Bt[dy][qy];                                 \
+    }                                                                          \
+    QDD[qz][dy][dx][l] = u;                                                    \
+  }
+
+#define MASS3DPA_ATOMIC_SIMD_8                                                 \
+  Real_type r_u[VL];                                                           \
+  CPU_FOREACH_LANE(l) {                                                        \
+    Real_type u = 0.0;                                                         \
+    for (Index_type qz = 0; qz < mpa_at::Q1D; ++qz) {                          \
+      u += QDD[qz][dy][dx][l] * sm_Bt[dz][qz];                                 \
+    }                                                                          \
+    r_u[l] = u;                                                                \
+  }                                                                            \
+  const Index_type j = dx + mpa_at::D1D * (dy + dz * mpa_at::D1D);
+
+// scatter SoA -> AoS; lanes may share DOFs, so one atomic per valid lane
+#define MASS3DPA_ATOMIC_SIMD_9(atomicAdd)                                      \
+  for (Index_type l = 0; l < nel; ++l) {                                       \
+    atomicAdd(Y[thread_dofs[j][l]], r_u[l]);                                   \
+  }
+
 namespace rajaperf {
 class RunParams;
 

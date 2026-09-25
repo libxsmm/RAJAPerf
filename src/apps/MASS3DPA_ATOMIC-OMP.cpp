@@ -37,12 +37,12 @@ void MASS3DPA_ATOMIC::runOpenMPVariant(VariantID vid) {
 
 RP_CALI_SUBKERNEL_BEGIN("MASS3DPA_ATOMIC_1");
 #pragma omp parallel for
-      for (Index_type e = 0; e < NE; ++e) {
+      for (Index_type e0 = 0; e0 < NE; e0 += FEM_VL) {
 
-        MASS3DPA_ATOMIC_0_CPU;
+        MASS3DPA_ATOMIC_0_CPU_SIMD;
 
         SHARED_LOOP_3D(dx, dy, dz, mpa_at::D1D, mpa_at::D1D, mpa_at::D1D) {
-          MASS3DPA_ATOMIC_1;
+          MASS3DPA_ATOMIC_SIMD_1;
         }
 
         SHARED_LOOP_2D(q, d, mpa_at::Q1D, mpa_at::D1D) {
@@ -50,28 +50,28 @@ RP_CALI_SUBKERNEL_BEGIN("MASS3DPA_ATOMIC_1");
         }
 
         SHARED_LOOP_3D(qx, dy, dz, mpa_at::Q1D, mpa_at::D1D, mpa_at::D1D) {
-          MASS3DPA_ATOMIC_3;
+          MASS3DPA_ATOMIC_SIMD_3;
         }
 
         SHARED_LOOP_3D(qx, qy, dz, mpa_at::Q1D, mpa_at::Q1D, mpa_at::D1D) {
-          MASS3DPA_ATOMIC_4;
+          MASS3DPA_ATOMIC_SIMD_4;
         }
 
         SHARED_LOOP_3D(qx, qy, qz, mpa_at::Q1D, mpa_at::Q1D, mpa_at::Q1D) {
-          MASS3DPA_ATOMIC_5;
+          MASS3DPA_ATOMIC_SIMD_5;
         }
 
         SHARED_LOOP_3D(dx, qy, qz, mpa_at::D1D, mpa_at::Q1D, mpa_at::Q1D) {
-          MASS3DPA_ATOMIC_6;
+          MASS3DPA_ATOMIC_SIMD_6;
         }
 
         SHARED_LOOP_3D(dx, dy, qz, mpa_at::D1D, mpa_at::D1D, mpa_at::Q1D) {
-          MASS3DPA_ATOMIC_7;
+          MASS3DPA_ATOMIC_SIMD_7;
         }
 
         SHARED_LOOP_3D(dx, dy, dz, mpa_at::D1D, mpa_at::D1D, mpa_at::D1D) {
-          MASS3DPA_ATOMIC_8;
-          MASS3DPA_ATOMIC_9(RAJAPERF_ATOMIC_ADD_OMP);
+          MASS3DPA_ATOMIC_SIMD_8;
+          MASS3DPA_ATOMIC_SIMD_9(RAJAPERF_ATOMIC_ADD_OMP);
         }
 
       } // element loop
@@ -107,10 +107,10 @@ RP_CALI_SUBKERNEL_END("MASS3DPA_ATOMIC_1");
         RAJA::LaunchParams(),
         [=] RAJA_HOST_DEVICE(RAJA::LaunchContext ctx) {
 
-          RAJA::loop<outer_x>(ctx, RAJA::RangeSegment(0, NE),
-            [&](Index_type e) {
+          RAJA::loop<outer_x>(ctx, RAJA::RangeStrideSegment(0, NE, FEM_VL),
+            [&](Index_type e0) {
 
-            MASS3DPA_ATOMIC_0_CPU;
+            MASS3DPA_ATOMIC_0_CPU_SIMD;
 
             RAJA::loop<inner_z>(ctx, RAJA::RangeSegment(0, mpa_at::D1D),
               [&](Index_type dz) {
@@ -118,7 +118,7 @@ RP_CALI_SUBKERNEL_END("MASS3DPA_ATOMIC_1");
                   [&](Index_type dy) {
                     RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, mpa_at::D1D),
                       [&](Index_type dx) {
-                      MASS3DPA_ATOMIC_1;
+                      MASS3DPA_ATOMIC_SIMD_1;
                       } // lambda (dx)
                     ); // RAJA::loop<inner_x>
                   } // lambda (dy)
@@ -147,7 +147,7 @@ RP_CALI_SUBKERNEL_END("MASS3DPA_ATOMIC_1");
                   [&](Index_type dy) {
                     RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, mpa_at::Q1D),
                       [&](Index_type qx) {
-                      MASS3DPA_ATOMIC_3;
+                      MASS3DPA_ATOMIC_SIMD_3;
                       } // lambda (qx)
                     ); // RAJA::loop<inner_x>
                   } // lambda (dy)
@@ -162,7 +162,7 @@ RP_CALI_SUBKERNEL_END("MASS3DPA_ATOMIC_1");
                   [&](Index_type qy) {
                     RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, mpa_at::Q1D),
                       [&](Index_type qx) {
-                      MASS3DPA_ATOMIC_4;
+                      MASS3DPA_ATOMIC_SIMD_4;
                       } // lambda (qx)
                     ); // RAJA::loop<inner_x>
                   } // lambda (qy)
@@ -177,7 +177,7 @@ RP_CALI_SUBKERNEL_END("MASS3DPA_ATOMIC_1");
                   [&](Index_type qy) {
                     RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, mpa_at::Q1D),
                       [&](Index_type qx) {
-                      MASS3DPA_ATOMIC_5;
+                      MASS3DPA_ATOMIC_SIMD_5;
                       } // lambda (qx)
                     ); // RAJA::loop<inner_x>
                   } // lambda (qy)
@@ -192,7 +192,7 @@ RP_CALI_SUBKERNEL_END("MASS3DPA_ATOMIC_1");
                   [&](Index_type qy) {
                     RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, mpa_at::D1D),
                       [&](Index_type dx) {
-                      MASS3DPA_ATOMIC_6;
+                      MASS3DPA_ATOMIC_SIMD_6;
                       } // lambda (qx)
                     ); // RAJA::loop<inner_x>
                   } // lambda (qy)
@@ -207,7 +207,7 @@ RP_CALI_SUBKERNEL_END("MASS3DPA_ATOMIC_1");
                   [&](Index_type dy) {
                     RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, mpa_at::D1D),
                       [&](Index_type dx) {
-                      MASS3DPA_ATOMIC_7;
+                      MASS3DPA_ATOMIC_SIMD_7;
                       } // lambda (qx)
                     ); // RAJA::loop<inner_x>
                   } // lambda (dy)
@@ -223,8 +223,8 @@ RP_CALI_SUBKERNEL_END("MASS3DPA_ATOMIC_1");
                   [&](Index_type dy) {
                     RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, mpa_at::D1D),
                       [&](Index_type dx) {
-                      MASS3DPA_ATOMIC_8;
-                      MASS3DPA_ATOMIC_9(RAJAPERF_ATOMIC_ADD_RAJA_OMP);
+                      MASS3DPA_ATOMIC_SIMD_8;
+                      MASS3DPA_ATOMIC_SIMD_9(RAJAPERF_ATOMIC_ADD_RAJA_OMP);
                       } // lambda (dx)
                     ); // RAJA::loop<inner_x>
                   } // lambda (dy)

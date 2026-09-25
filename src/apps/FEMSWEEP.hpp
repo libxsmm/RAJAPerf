@@ -92,6 +92,8 @@
 
 #include "FEMSWEEPMeshGen.hpp"
 
+#include "FEM_MACROS.hpp"
+
 constexpr long ND = 8;   // number of corners per element
 constexpr long NLF = 6;  // number of faces per element
 constexpr long FDS = 4;  // number of DOFs per face
@@ -163,6 +165,61 @@ constexpr long FDS = 4;  // number of DOFs per face
   } \
   const Real_type s = Sgdat[e + g * ne]; \
   SolveLinearSystemNxN<ND>(A, s, &M0dat[0 + 0 * ND + e * ND * ND], b, &Xdat[e * ND + g * ND * ne + a * ng * ND * ne]);
+
+//
+// CPU SoA variant: batch of FEM_VL energy groups [g0, g0+FEM_VL) of angle a,
+// group (lane) index innermost. A, M0, F and all mesh connectivity depend
+// only on (a, e), so control flow is identical across lanes.
+//
+#define FEMSWEEP_KERNEL_SETUP_SIMD \
+  FEMSWEEP_KERNEL_SETUP \
+  FEM_BATCH_SETUP(g0, ng);
+
+#define FEMSWEEP_KERNEL_HYPERPLANE_ELEMENT_SIMD \
+  const Index_type e = order_r[k + nehp_pos + a * ne]; \
+  Real_type b[ND][FEM_VL]; \
+  for (Index_type j = 0; j < ND; ++j) \
+  { \
+    const Real_type bj = Bdat[j + e * ND + a * ne * ND]; \
+    CPU_FOREACH_LANE(l) { b[j][l] = bj; } \
+  } \
+  for (Index_type face = 0; face < NLF; ++face) \
+  { \
+    const Index_type sf_gl = F_g2l[elem_to_faces[NLF * e + face]]; \
+    const Index_type f = sf_gl >= 0 ? sf_gl : -1 - sf_gl; \
+    const Index_type s = (e == idx1[f * FDS] / ND) ? 0 : 1; \
+    if ((AngleElem2FaceType[face + e * NLF + a * ne * NLF] == 0) || (sf_gl < 0)) \
+    { \
+      continue; \
+    } \
+    for (Index_type j = 0; j < FDS; ++j) \
+    { \
+      const Index_type ffj = f * FDS + j; \
+      const Index_type djs = s == 0 ? idx1[ffj] : idx2[ffj]; \
+      Real_type F[FEM_VL]; \
+      CPU_FOREACH_LANE(l) { F[l] = 0.0; } \
+      for (Index_type i = 0; i < FDS; i++) \
+      { \
+        const Index_type ffi = f * FDS + i; \
+        const Index_type dis = s == 0 ? idx2[ffi] : idx1[ffi]; \
+        const Real_type Fij = Ffactor * Fdat[i + j * FDS + (s ^ 1) * FDS * FDS + f * 2 * FDS * FDS + a * sharedinteriorfaces * 2 * FDS * FDS]; \
+        /* gather AoS -> SoA */ \
+        CPU_FOREACH_LANE(l) { F[l] += Fij * Xdat[dis + le[l] * ND * ne + a * ng * ND * ne]; } \
+      } \
+      CPU_FOREACH_LANE(l) { b[djs % ND][l] -= F[l]; } \
+    } \
+  } \
+  Real_type sg[FEM_VL]; \
+  CPU_FOREACH_LANE(l) { sg[l] = Sgdat[e + le[l] * ne]; } \
+  Real_type xs[ND][FEM_VL]; \
+  SolveLinearSystemNxN_simd<ND>(&Adat[e * ND * ND + a * ne * ND * ND], sg, &M0dat[e * ND * ND], b, xs); \
+  /* scatter SoA -> AoS (valid lanes only) */ \
+  for (Index_type ii = 0; ii < ND; ++ii) \
+  { \
+    CPU_FOREACH_LANE(l) { \
+      if (l < nel) { Xdat[ii + e * ND + (g0 + l) * ND * ne + a * ng * ND * ne] = xs[ii][l]; } \
+    } \
+  }
 
 
 namespace rajaperf
@@ -264,6 +321,100 @@ RAJA_HOST_DEVICE inline void SolveLinearSystemNxN(Real_ptr A,
     x[ii] = tempx[ii] = D[ii] - sum;
   }
 
+}
+
+// SolveLinearSystemNxN for FEM_VL independent systems sharing A and M,
+// system (lane) index innermost.
+template <long N>
+RAJA_INLINE void SolveLinearSystemNxN_simd(Real_const_ptr A,
+                                           const Real_type (&s)[FEM_VL],
+                                           Real_const_ptr M,
+                                           const Real_type (&b)[N][FEM_VL],
+                                           Real_type (&x)[N][FEM_VL])
+{
+  Real_type tempA[N][N][FEM_VL];
+  Real_type L[N][N][FEM_VL];
+  Real_type U[N][N][FEM_VL];
+  Real_type D[N][FEM_VL];
+  Real_type sum[FEM_VL];
+
+  // tempA = A + s * M0
+  // set L to 0, U to identity
+  for ( Index_type ii = 0; ii < N; ++ii )
+  {
+    for ( Index_type jj = 0; jj < N; ++jj )
+    {
+      const Real_type Aij = A[ii * N + jj];
+      const Real_type Mij = M[ii * N + jj];
+      const Real_type Uij = ( ii == jj ) ? 1.0 : 0.0;
+      CPU_FOREACH_LANE(l) {
+        tempA[ii][jj][l] = Aij + s[l] * Mij;
+        L[ii][jj][l] = 0.0;
+        U[ii][jj][l] = Uij;
+      }
+    }
+  }
+
+  // set first column of L, and first row of U
+  for ( Index_type ii = 0; ii < N; ++ii )
+  {
+    CPU_FOREACH_LANE(l) { L[ii][0][l] = tempA[ii][0][l]; }
+  }
+
+  for ( Index_type ii = 1; ii < N; ++ii )
+  {
+    CPU_FOREACH_LANE(l) { U[0][ii][l] = tempA[0][ii][l]/tempA[0][0][l]; }
+  }
+
+  // form L & U
+  for ( Index_type ii = 1; ii < N; ++ii )
+  {
+    // L column formation
+    for ( Index_type jj = ii; jj < N; ++jj )
+    {
+      CPU_FOREACH_LANE(l) { sum[l] = 0.0; }
+      for ( Index_type kk = 0; kk < jj; ++kk )
+      {
+        CPU_FOREACH_LANE(l) { sum[l] += L[jj][kk][l] * U[kk][ii][l]; }
+      }
+      CPU_FOREACH_LANE(l) { L[jj][ii][l] = tempA[jj][ii][l] - sum[l]; }
+    }
+
+    // U row formation
+    for ( Index_type jj = ii+1; jj < N; ++jj )
+    {
+      CPU_FOREACH_LANE(l) { sum[l] = 0.0; }
+      for ( Index_type kk = 0; kk < ii; ++kk )
+      {
+        CPU_FOREACH_LANE(l) { sum[l] += L[ii][kk][l] * U[kk][jj][l]; }
+      }
+      CPU_FOREACH_LANE(l) { U[ii][jj][l] = (tempA[ii][jj][l] - sum[l])/L[ii][ii][l]; }
+    }
+  }
+
+  // forward substitution
+  CPU_FOREACH_LANE(l) { D[0][l] = b[0][l]/L[0][0][l]; }
+  for ( Index_type ii = 1; ii < N; ++ii )
+  {
+    CPU_FOREACH_LANE(l) { sum[l] = 0.0; }
+    for ( Index_type jj = 0; jj < ii; ++jj )
+    {
+      CPU_FOREACH_LANE(l) { sum[l] += L[ii][jj][l] * D[jj][l]; }
+    }
+    CPU_FOREACH_LANE(l) { D[ii][l] = (b[ii][l] - sum[l])/L[ii][ii][l]; }
+  }
+
+  // backward substitution
+  CPU_FOREACH_LANE(l) { x[N-1][l] = D[N-1][l]; }
+  for ( Index_type ii = N - 1 - 1; ii > -1; --ii )
+  {
+    CPU_FOREACH_LANE(l) { sum[l] = 0.0; }
+    for ( Index_type jj = ii+1; jj < N; ++jj )
+    {
+      CPU_FOREACH_LANE(l) { sum[l] += U[ii][jj][l] * x[jj][l]; }
+    }
+    CPU_FOREACH_LANE(l) { x[ii][l] = D[ii][l] - sum[l]; }
+  }
 }
 
 

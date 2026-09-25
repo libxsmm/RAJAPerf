@@ -138,6 +138,64 @@ constexpr RAJA::Index_type Q1D = 5;
     }                                                                          \
   }
 
+//
+// CPU SoA variant: batch of FEM_VL elements starting at e0, element innermost.
+// Output is produced one contiguous 64-entry i-block per (j1,j2,j3); i1 gives
+// D1D independent accumulators. Stage 1 (basis load) is reused as is.
+//
+#define MASS3DEA_0_CPU_SIMD                                                    \
+  FEM_BATCH_SETUP(e0, NE);                                                     \
+  Real_type s_B[mea::Q1D][mea::D1D];
+
+#define MASS3DEA_2_CPU_SIMD Real_type s_D[mea::Q1D][mea::Q1D][mea::Q1D][FEM_VL];
+
+// gather AoS -> SoA
+#define MASS3DEA_SIMD_3                                                        \
+  CPU_FOREACH_LANE(l) { s_D[k1][k2][k3][l] = MEA_D(k1, k2, k3, le[l]); }
+
+#define MASS3DEA_SIMD_4                                                        \
+  Real_type s_M[mea::D1D * mea::D1D * mea::D1D][FEM_VL];                       \
+  for (Index_type i3 = 0; i3 < mea::D1D; ++i3) {                               \
+    for (Index_type i2 = 0; i2 < mea::D1D; ++i2) {                             \
+      Real_type val[mea::D1D][FEM_VL];                                         \
+      for (Index_type i1 = 0; i1 < mea::D1D; ++i1) {                           \
+        CPU_FOREACH_LANE(l) { val[i1][l] = 0.0; }                              \
+      }                                                                        \
+      for (Index_type k1 = 0; k1 < mea::Q1D; ++k1) {                           \
+        Real_type b1[mea::D1D];                                                \
+        for (Index_type i1 = 0; i1 < mea::D1D; ++i1) {                         \
+          b1[i1] = s_B[k1][i1] * s_B[k1][j1];                                  \
+        }                                                                      \
+        for (Index_type k2 = 0; k2 < mea::Q1D; ++k2) {                         \
+          Real_type b12[mea::D1D];                                             \
+          for (Index_type i1 = 0; i1 < mea::D1D; ++i1) {                       \
+            b12[i1] = b1[i1] * s_B[k2][i2] * s_B[k2][j2];                      \
+          }                                                                    \
+          for (Index_type k3 = 0; k3 < mea::Q1D; ++k3) {                       \
+            for (Index_type i1 = 0; i1 < mea::D1D; ++i1) {                     \
+              const Real_type b = b12[i1] * s_B[k3][i3] * s_B[k3][j3];         \
+              CPU_FOREACH_LANE(l) { val[i1][l] += b * s_D[k1][k2][k3][l]; }    \
+            }                                                                  \
+          }                                                                    \
+        }                                                                      \
+      }                                                                        \
+      for (Index_type i1 = 0; i1 < mea::D1D; ++i1) {                           \
+        CPU_FOREACH_LANE(l) {                                                  \
+          s_M[i1 + mea::D1D * (i2 + mea::D1D * i3)][l] = val[i1][l];           \
+        }                                                                      \
+      }                                                                        \
+    }                                                                          \
+  }                                                                            \
+  /* scatter SoA -> AoS: one contiguous i-block per valid element */           \
+  for (Index_type l = 0; l < nel; ++l) {                                       \
+    const Index_type e = e0 + l;                                               \
+    Real_ptr Mblk = &MEA_M(0, 0, 0, j1, j2, j3, e);                            \
+    FEM_OMP_SIMD                                                               \
+    for (Index_type i = 0; i < mea::D1D * mea::D1D * mea::D1D; ++i) {          \
+      Mblk[i] = s_M[i][l];                                                     \
+    }                                                                          \
+  }
+
 namespace rajaperf {
 class RunParams;
 

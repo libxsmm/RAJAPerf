@@ -11,6 +11,8 @@
 
 #include "RAJA/RAJA.hpp"
 
+#include "common/RPTypes.hpp"
+
 #if defined(USE_RAJAPERF_UNROLL)
 // If enabled uses RAJA's RAJA_UNROLL_COUNT which is always on
 #define RAJAPERF_UNROLL(N) RAJA_UNROLL_COUNT(N)
@@ -60,6 +62,30 @@
 #endif
 
 #define CPU_FOREACH(i, k, N) for (Index_type i = 0; i < N; i++)
+
+// CPU SoA variants process FEM_VL elements per batch (one 512-bit vector),
+// element (lane) index innermost.
+constexpr RAJA::Index_type FEM_VL = 64 / sizeof(rajaperf::Real_type);
+
+#if defined(_OPENMP) && defined(__clang__)
+// keep clang from fully unrolling the short lane loop before it vectorizes
+#define FEM_OMP_SIMD _Pragma("omp simd") _Pragma("clang loop unroll(disable)")
+#elif defined(_OPENMP)
+#define FEM_OMP_SIMD _Pragma("omp simd")
+#else
+#define FEM_OMP_SIMD
+#endif
+
+#define CPU_FOREACH_LANE(l) FEM_OMP_SIMD for (Index_type l = 0; l < FEM_VL; l++)
+
+// Lane -> element map for batch [e0, e0+FEM_VL); tail lanes replicate the
+// last valid element so all lanes compute on valid data.
+#define FEM_BATCH_SETUP(e0, NE)                                                \
+  const Index_type nel = ((NE) - (e0) < FEM_VL) ? (NE) - (e0) : FEM_VL;        \
+  Index_type le[FEM_VL];                                                       \
+  for (Index_type l = 0; l < FEM_VL; l++) {                                    \
+    le[l] = (e0) + ((l < nel) ? l : nel - 1);                                  \
+  }
 
 #define SHARED_LOOP_2D(tx, ty, Nx, Ny)                                         \
   for (Index_type ty = 0; ty < Ny; ty++)                                       \

@@ -38,9 +38,9 @@ void MASSVEC3DPA::runOpenMPVariant(VariantID vid)
 
 RP_CALI_SUBKERNEL_BEGIN("MASSVEC3DPA_1");
 #pragma omp parallel for
-      for (Index_type e = 0; e < NE; ++e) {
+      for (Index_type e0 = 0; e0 < NE; e0 += FEM_VL) {
 
-        MASSVEC3DPA_0_CPU;
+        MASSVEC3DPA_0_CPU_SIMD;
 
         SHARED_LOOP_2D(q, d, mvpa::Q1D, mvpa::D1D) {
           MASSVEC3DPA_1;
@@ -49,32 +49,32 @@ RP_CALI_SUBKERNEL_BEGIN("MASSVEC3DPA_1");
         for (Index_type c = 0; c < 3; ++c) {
           SHARED_LOOP_3D(dx, dy, dz, mvpa::D1D, mvpa::D1D, mvpa::D1D) {
 
-            MASSVEC3DPA_2;
+            MASSVEC3DPA_SIMD_2;
           }
 
           SHARED_LOOP_3D(qx, dy, dz, mvpa::Q1D, mvpa::D1D, mvpa::D1D) {
 
-            MASSVEC3DPA_3;
+            MASSVEC3DPA_SIMD_3;
           }
 
           SHARED_LOOP_3D(qx, qy, dz, mvpa::Q1D, mvpa::Q1D, mvpa::D1D) {
-            MASSVEC3DPA_4;
+            MASSVEC3DPA_SIMD_4;
           }
 
           SHARED_LOOP_3D(qx, qy, qz, mvpa::Q1D, mvpa::Q1D, mvpa::Q1D) {
-            MASSVEC3DPA_5;
+            MASSVEC3DPA_SIMD_5;
           }
 
           SHARED_LOOP_3D(dx, qy, qz, mvpa::D1D, mvpa::Q1D, mvpa::Q1D) {
-            MASSVEC3DPA_6;
+            MASSVEC3DPA_SIMD_6;
           }
 
           SHARED_LOOP_3D(dx, dy, qz, mvpa::D1D, mvpa::D1D, mvpa::Q1D) {
-            MASSVEC3DPA_7;
+            MASSVEC3DPA_SIMD_7;
           }
 
           SHARED_LOOP_3D(dx, dy, dz, mvpa::D1D, mvpa::D1D, mvpa::D1D) {
-            MASSVEC3DPA_8;
+            MASSVEC3DPA_SIMD_8;
           }
 
         } //(c) dimension loop
@@ -112,10 +112,10 @@ RP_CALI_SUBKERNEL_END("MASSVEC3DPA_1");
         RAJA::LaunchParams(),
         [=] RAJA_HOST_DEVICE(RAJA::LaunchContext ctx) {
 
-          RAJA::loop<outer_x>(ctx, RAJA::RangeSegment(0, NE),
-            [&](Index_type e) {
+          RAJA::loop<outer_x>(ctx, RAJA::RangeStrideSegment(0, NE, FEM_VL),
+            [&](Index_type e0) {
 
-            MASSVEC3DPA_0_CPU;
+            MASSVEC3DPA_0_CPU_SIMD;
 
             //3 loops to remain consistent with the GPU versions
             //Masking out of the z-dimension thread is done with GPU versions
@@ -141,7 +141,7 @@ RP_CALI_SUBKERNEL_END("MASSVEC3DPA_1");
                   [&](Index_type dy) {
                     RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, mvpa::D1D),
                       [&](Index_type dx) {
-                        MASSVEC3DPA_2;
+                        MASSVEC3DPA_SIMD_2;
                       } // lambda (dx)
                     ); // RAJA::loop<inner_x>
                   } // lambda (dy)
@@ -157,7 +157,7 @@ RP_CALI_SUBKERNEL_END("MASSVEC3DPA_1");
                   [&](Index_type dy) {
                     RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, mvpa::Q1D),
                       [&](Index_type qx) {
-                        MASSVEC3DPA_3;
+                        MASSVEC3DPA_SIMD_3;
                       } // lambda (qx)
                     ); // RAJA::loop<inner_x>
                   } // lambda (dy)
@@ -173,7 +173,7 @@ RP_CALI_SUBKERNEL_END("MASSVEC3DPA_1");
                   [&](Index_type qy) {
                     RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, mvpa::Q1D),
                       [&](Index_type qx) {
-                        MASSVEC3DPA_4;
+                        MASSVEC3DPA_SIMD_4;
                       } // lambda (qx)
                     ); // RAJA::loop<inner_x>
                   } // lambda (qy)
@@ -189,7 +189,7 @@ RP_CALI_SUBKERNEL_END("MASSVEC3DPA_1");
                   [&](Index_type qy) {
                     RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, mvpa::Q1D),
                       [&](Index_type qx) {
-                        MASSVEC3DPA_5;
+                        MASSVEC3DPA_SIMD_5;
                       } // lambda (qx)
                     ); // RAJA::loop<inner_x>
                   } // lambda (qy)
@@ -205,7 +205,7 @@ RP_CALI_SUBKERNEL_END("MASSVEC3DPA_1");
                   [&](Index_type qy) {
                     RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, mvpa::D1D),
                       [&](Index_type dx) {
-                        MASSVEC3DPA_6;
+                        MASSVEC3DPA_SIMD_6;
                       } // lambda (dx)
                     ); // RAJA::loop<inner_x>
                   } // lambda (qy)
@@ -221,7 +221,7 @@ RP_CALI_SUBKERNEL_END("MASSVEC3DPA_1");
                   [&](Index_type dy) {
                     RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, mvpa::D1D),
                       [&](Index_type dx) {
-                        MASSVEC3DPA_7;
+                        MASSVEC3DPA_SIMD_7;
                       } // lambda (dx)
                     ); // RAJA::loop<inner_x>
                   } // lambda (dy)
@@ -237,7 +237,7 @@ RP_CALI_SUBKERNEL_END("MASSVEC3DPA_1");
                   [&](Index_type dy) {
                     RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, mvpa::D1D),
                       [&](Index_type dx) {
-                      MASSVEC3DPA_8;
+                      MASSVEC3DPA_SIMD_8;
                       } // lambda (dx)
                     ); // RAJA::loop<inner_x>
                   } // lambda (dy)

@@ -36,14 +36,14 @@ void DIFFUSION3DPA::runOpenMPVariant(VariantID vid) {
 
 RP_CALI_SUBKERNEL_BEGIN("DIFFUSION3DPA_1");
 #pragma omp parallel for
-      for (Index_type e = 0; e < NE; ++e) {
+      for (Index_type e0 = 0; e0 < NE; e0 += FEM_VL) {
 
-        DIFFUSION3DPA_0_CPU;
+        DIFFUSION3DPA_0_CPU_SIMD;
 
         CPU_FOREACH(dz,z,diff::D1D) {
           CPU_FOREACH(dy,y,diff::D1D) {
             CPU_FOREACH(dx,x,diff::D1D) {
-              DIFFUSION3DPA_1
+              DIFFUSION3DPA_SIMD_1
             }
           }
         }
@@ -58,7 +58,7 @@ RP_CALI_SUBKERNEL_BEGIN("DIFFUSION3DPA_1");
           CPU_FOREACH(dy,y,diff::D1D) {
             CPU_FOREACH(qx,x,diff::Q1D) {
 
-              DIFFUSION3DPA_3
+              DIFFUSION3DPA_SIMD_3
             }
           }
         }
@@ -66,7 +66,7 @@ RP_CALI_SUBKERNEL_BEGIN("DIFFUSION3DPA_1");
         CPU_FOREACH(dz,z,diff::D1D) {
           CPU_FOREACH(qy,y,diff::Q1D) {
             CPU_FOREACH(qx,x,diff::Q1D) {
-              DIFFUSION3DPA_4
+              DIFFUSION3DPA_SIMD_4
             }
           }
         }
@@ -74,7 +74,7 @@ RP_CALI_SUBKERNEL_BEGIN("DIFFUSION3DPA_1");
         CPU_FOREACH(qz,z,diff::Q1D) {
           CPU_FOREACH(qy,y,diff::Q1D) {
             CPU_FOREACH(qx,x,diff::Q1D) {
-              DIFFUSION3DPA_5
+              DIFFUSION3DPA_SIMD_5
             }
           }
         }
@@ -88,7 +88,7 @@ RP_CALI_SUBKERNEL_BEGIN("DIFFUSION3DPA_1");
         CPU_FOREACH(qz,z,diff::Q1D) {
           CPU_FOREACH(qy,y,diff::Q1D) {
             CPU_FOREACH(dx,x,diff::D1D) {
-              DIFFUSION3DPA_7
+              DIFFUSION3DPA_SIMD_7
             }
           }
         }
@@ -96,7 +96,7 @@ RP_CALI_SUBKERNEL_BEGIN("DIFFUSION3DPA_1");
         CPU_FOREACH(qz,z,diff::Q1D) {
           CPU_FOREACH(dy,y,diff::D1D) {
             CPU_FOREACH(dx,x,diff::D1D) {
-              DIFFUSION3DPA_8
+              DIFFUSION3DPA_SIMD_8
             }
           }
         }
@@ -104,7 +104,7 @@ RP_CALI_SUBKERNEL_BEGIN("DIFFUSION3DPA_1");
         CPU_FOREACH(dz,z,diff::D1D) {
           CPU_FOREACH(dy,y,diff::D1D) {
             CPU_FOREACH(dx,x,diff::D1D) {
-              DIFFUSION3DPA_9
+              DIFFUSION3DPA_SIMD_9
             }
           }
         }
@@ -143,10 +143,10 @@ RP_CALI_SUBKERNEL_END("DIFFUSION3DPA_1");
           RAJA::LaunchParams(),
           [=] RAJA_HOST_DEVICE(RAJA::LaunchContext ctx) {
 
-          RAJA::loop<outer_x>(ctx, RAJA::RangeSegment(0, NE),
-            [&](Index_type e) {
+          RAJA::loop<outer_x>(ctx, RAJA::RangeStrideSegment(0, NE, FEM_VL),
+            [&](Index_type e0) {
 
-              DIFFUSION3DPA_0_CPU;
+              DIFFUSION3DPA_0_CPU_SIMD;
 
               RAJA::loop<inner_z>(ctx, RAJA::RangeSegment(0, diff::D1D),
                 [&](Index_type dz) {
@@ -155,7 +155,7 @@ RP_CALI_SUBKERNEL_END("DIFFUSION3DPA_1");
                       RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, diff::D1D),
                         [&](Index_type dx) {
 
-                          DIFFUSION3DPA_1;
+                          DIFFUSION3DPA_SIMD_1;
 
                         } // lambda (dx)
                       ); // RAJA::loop<inner_x>
@@ -191,7 +191,7 @@ RP_CALI_SUBKERNEL_END("DIFFUSION3DPA_1");
                       RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, diff::Q1D),
                         [&](Index_type qx) {
 
-                          DIFFUSION3DPA_3;
+                          DIFFUSION3DPA_SIMD_3;
 
                         } // lambda (qx)
                       ); // RAJA::loop<inner_x>
@@ -209,7 +209,7 @@ RP_CALI_SUBKERNEL_END("DIFFUSION3DPA_1");
                       RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, diff::Q1D),
                         [&](Index_type qx) {
 
-                          DIFFUSION3DPA_4;
+                          DIFFUSION3DPA_SIMD_4;
 
                         } // lambda (qx)
                       ); // RAJA::loop<inner_x>
@@ -227,7 +227,7 @@ RP_CALI_SUBKERNEL_END("DIFFUSION3DPA_1");
                      RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, diff::Q1D),
                        [&](Index_type qx) {
 
-                        DIFFUSION3DPA_5;
+                        DIFFUSION3DPA_SIMD_5;
 
                        } // lambda (qx)
                      ); // RAJA::loop<inner_x>
@@ -263,7 +263,7 @@ RP_CALI_SUBKERNEL_END("DIFFUSION3DPA_1");
                      RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, diff::D1D),
                        [&](Index_type dx) {
 
-                        DIFFUSION3DPA_7;
+                        DIFFUSION3DPA_SIMD_7;
 
                        } // lambda (dx)
                      ); // RAJA::loop<inner_x>
@@ -281,7 +281,7 @@ RP_CALI_SUBKERNEL_END("DIFFUSION3DPA_1");
                      RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, diff::D1D),
                        [&](Index_type dx) {
 
-                         DIFFUSION3DPA_8;
+                         DIFFUSION3DPA_SIMD_8;
 
                        } // lambda (dx)
                      ); // RAJA::loop<inner_x>
@@ -299,7 +299,7 @@ RP_CALI_SUBKERNEL_END("DIFFUSION3DPA_1");
                      RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, diff::D1D),
                        [&](Index_type dx) {
 
-                         DIFFUSION3DPA_9;
+                         DIFFUSION3DPA_SIMD_9;
 
                        } // lambda (dx)
                      ); // RAJA::loop<inner_x>

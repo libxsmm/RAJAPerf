@@ -244,6 +244,91 @@ constexpr RAJA::Index_type DIM = 3;
   }                                                                            \
   MVPA_Y(dx, dy, dz, c, e) = u;
 
+//
+// CPU SoA variant: batch of FEM_VL elements starting at e0, element innermost.
+// Stage 1 (basis load) is element independent and reused as is.
+//
+#define MASSVEC3DPA_0_CPU_SIMD                                                 \
+  constexpr Index_type MQ1 = mvpa::Q1D;                                        \
+  constexpr Index_type MD1 = mvpa::D1D;                                        \
+  constexpr Index_type MDQ = (MQ1 > MD1) ? MQ1 : MD1;                          \
+  constexpr Index_type VL = FEM_VL;                                            \
+  FEM_BATCH_SETUP(e0, NE);                                                     \
+  Real_type smB[MQ1][MD1];                                                     \
+  Real_type smBt[MD1][MQ1];                                                    \
+  Real_type sm0[MDQ * MDQ * MDQ][VL];                                          \
+  Real_type sm1[MDQ * MDQ * MDQ][VL];                                          \
+  Real_type(*smX)[MD1][MD1][VL] = (Real_type(*)[MD1][MD1][VL])sm0;             \
+  Real_type(*DDQ)[MD1][MQ1][VL] = (Real_type(*)[MD1][MQ1][VL])sm1;             \
+  Real_type(*DQQ)[MQ1][MQ1][VL] = (Real_type(*)[MQ1][MQ1][VL])sm0;             \
+  Real_type(*QQQ)[MQ1][MQ1][VL] = (Real_type(*)[MQ1][MQ1][VL])sm1;             \
+  Real_type(*QQD)[MQ1][MD1][VL] = (Real_type(*)[MQ1][MD1][VL])sm0;             \
+  Real_type(*QDD)[MD1][MD1][VL] = (Real_type(*)[MD1][MD1][VL])sm1;
+
+// gather AoS -> SoA
+#define MASSVEC3DPA_SIMD_2                                                     \
+  CPU_FOREACH_LANE(l) {                                                        \
+    smX[dz][dy][dx][l] = MVPA_X(dx, dy, dz, c, le[l]);                         \
+  }
+
+#define MASSVEC3DPA_SIMD_3                                                     \
+  CPU_FOREACH_LANE(l) {                                                        \
+    Real_type u = 0.0;                                                         \
+    for (Index_type dx = 0; dx < mvpa::D1D; ++dx) {                            \
+      u += smX[dz][dy][dx][l] * smB[qx][dx];                                   \
+    }                                                                          \
+    DDQ[dz][dy][qx][l] = u;                                                    \
+  }
+
+#define MASSVEC3DPA_SIMD_4                                                     \
+  CPU_FOREACH_LANE(l) {                                                        \
+    Real_type u = 0.0;                                                         \
+    for (Index_type dy = 0; dy < mvpa::D1D; ++dy) {                            \
+      u += DDQ[dz][dy][qx][l] * smB[qy][dy];                                   \
+    }                                                                          \
+    DQQ[dz][qy][qx][l] = u;                                                    \
+  }
+
+#define MASSVEC3DPA_SIMD_5                                                     \
+  CPU_FOREACH_LANE(l) {                                                        \
+    Real_type u = 0.0;                                                         \
+    for (Index_type dz = 0; dz < mvpa::D1D; ++dz) {                            \
+      u += DQQ[dz][qy][qx][l] * smB[qz][dz];                                   \
+    }                                                                          \
+    QQQ[qz][qy][qx][l] = u * MVPA_D(qx, qy, qz, le[l]);                        \
+  }
+
+#define MASSVEC3DPA_SIMD_6                                                     \
+  CPU_FOREACH_LANE(l) {                                                        \
+    Real_type u = 0.0;                                                         \
+    for (Index_type qx = 0; qx < mvpa::Q1D; ++qx) {                            \
+      u += QQQ[qz][qy][qx][l] * smBt[dx][qx];                                  \
+    }                                                                          \
+    QQD[qz][qy][dx][l] = u;                                                    \
+  }
+
+#define MASSVEC3DPA_SIMD_7                                                     \
+  CPU_FOREACH_LANE(l) {                                                        \
+    Real_type u = 0.0;                                                         \
+    for (Index_type qy = 0; qy < mvpa::Q1D; ++qy) {                            \
+      u += QQD[qz][qy][dx][l] * smBt[dy][qy];                                  \
+    }                                                                          \
+    QDD[qz][dy][dx][l] = u;                                                    \
+  }
+
+// scatter SoA -> AoS (valid lanes only)
+#define MASSVEC3DPA_SIMD_8                                                     \
+  CPU_FOREACH_LANE(l) {                                                        \
+    Real_type u = 0.0;                                                         \
+    for (Index_type qz = 0; qz < mvpa::Q1D; ++qz) {                            \
+      u += QDD[qz][dy][dx][l] * smBt[dz][qz];                                  \
+    }                                                                          \
+    if (l < nel) {                                                             \
+      const Index_type e = e0 + l;                                             \
+      MVPA_Y(dx, dy, dz, c, e) = u;                                            \
+    }                                                                          \
+  }
+
 namespace rajaperf {
 class RunParams;
 

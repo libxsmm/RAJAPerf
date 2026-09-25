@@ -36,10 +36,14 @@ void MASS3DEA::runOpenMPVariant(VariantID vid) {
     for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
 
 RP_CALI_SUBKERNEL_BEGIN("MASS3DEA_1");
-#pragma omp parallel for
-      for (Index_type e = 0; e < NE; ++e) {
+      // (batch, j-block) pairs keep all threads busy for small NE
+#pragma omp parallel for collapse(4)
+      for (Index_type e0 = 0; e0 < NE; e0 += FEM_VL) {
+      for (Index_type j3 = 0; j3 < mea::D1D; ++j3) {
+      for (Index_type j2 = 0; j2 < mea::D1D; ++j2) {
+      for (Index_type j1 = 0; j1 < mea::D1D; ++j1) {
 
-        MASS3DEA_0_CPU
+        MASS3DEA_0_CPU_SIMD
 
         CPU_FOREACH(d, x, mea::D1D) {
           CPU_FOREACH(q, y, mea::Q1D) {
@@ -47,25 +51,22 @@ RP_CALI_SUBKERNEL_BEGIN("MASS3DEA_1");
           }
         }
 
-        MASS3DEA_2_CPU
+        MASS3DEA_2_CPU_SIMD
 
         CPU_FOREACH(k1, x, mea::Q1D) {
           CPU_FOREACH(k2, y, mea::Q1D) {
             CPU_FOREACH(k3, z, mea::Q1D) {
-              MASS3DEA_3
+              MASS3DEA_SIMD_3
             }
           }
         }
 
-        CPU_FOREACH(i1, x, mea::D1D) {
-          CPU_FOREACH(i2, y, mea::D1D) {
-            CPU_FOREACH(i3, z, mea::D1D) {
-              MASS3DEA_4
-            }
-          }
-        }
+        MASS3DEA_SIMD_4
 
-      } // element loop
+      }
+      }
+      }
+      } // element batch loop
 RP_CALI_SUBKERNEL_END("MASS3DEA_1");
     }
     stopTimer();
@@ -88,6 +89,9 @@ RP_CALI_SUBKERNEL_END("MASS3DEA_1");
 
     using inner_z = RAJA::LoopPolicy<RAJA::seq_exec>;
 
+    constexpr Index_type njb = mea::D1D * mea::D1D * mea::D1D;
+    const Index_type nbe = (NE + FEM_VL - 1) / FEM_VL;
+
     startTimer();
     // Loop counter increment uses macro to quiet C++20 compiler warning
     for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
@@ -99,10 +103,16 @@ RP_CALI_SUBKERNEL_END("MASS3DEA_1");
         RAJA::LaunchParams(),
         [=] RAJA_HOST_DEVICE(RAJA::LaunchContext ctx) {
 
-          RAJA::loop<outer_x>(ctx, RAJA::RangeSegment(0, NE),
-            [&](Index_type e) {
+          // (batch, j-block) pairs keep all threads busy for small NE
+          RAJA::loop<outer_x>(ctx, RAJA::RangeSegment(0, nbe * njb),
+            [&](Index_type ej) {
 
-              MASS3DEA_0
+              const Index_type e0 = (ej / njb) * FEM_VL;
+              const Index_type j1 = ej % mea::D1D;
+              const Index_type j2 = (ej / mea::D1D) % mea::D1D;
+              const Index_type j3 = (ej / (mea::D1D * mea::D1D)) % mea::D1D;
+
+              MASS3DEA_0_CPU_SIMD
 
               RAJA::loop<inner_z>(ctx, RAJA::RangeSegment(0, 1),
                 [&](Index_type ) {
@@ -118,7 +128,7 @@ RP_CALI_SUBKERNEL_END("MASS3DEA_1");
                 }
               ); // RAJA::loop<inner_z>
 
-              MASS3DEA_2
+              MASS3DEA_2_CPU_SIMD
 
               RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, mea::Q1D),
                 [&](Index_type k1) {
@@ -126,7 +136,7 @@ RP_CALI_SUBKERNEL_END("MASS3DEA_1");
                     [&](Index_type k2) {
                       RAJA::loop<inner_z>(ctx, RAJA::RangeSegment(0, mea::Q1D),
                         [&](Index_type k3) {
-                          MASS3DEA_3
+                          MASS3DEA_SIMD_3
                         }
                       ); // RAJA::loop<inner_x>
                     }
@@ -136,21 +146,9 @@ RP_CALI_SUBKERNEL_END("MASS3DEA_1");
 
               ctx.teamSync();
 
-              RAJA::loop<inner_x>(ctx, RAJA::RangeSegment(0, mea::D1D),
-                [&](Index_type i1) {
-                  RAJA::loop<inner_y>(ctx, RAJA::RangeSegment(0, mea::D1D),
-                    [&](Index_type i2) {
-                      RAJA::loop<inner_z>(ctx, RAJA::RangeSegment(0, mea::D1D),
-                        [&](Index_type i3) {
-                          MASS3DEA_4
-                        }
-                      ); // RAJA::loop<inner_x>
-                    }
-                  ); // RAJA::loop<inner_y>
-                }
-              ); // RAJA::loop<inner_z>
+              MASS3DEA_SIMD_4
 
-            } // lambda (e)
+            } // lambda (ej)
           );    // RAJA::loop<outer_x>
 
         }  // outer lambda (ctx)

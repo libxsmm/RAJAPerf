@@ -404,6 +404,137 @@ constexpr RAJA::Index_type DPA_SYM = 6;
   }                                                                            \
   DPA_Y(dx, dy, dz, e) += (u + v + w);
 
+//
+// CPU SoA variant: batch of FEM_VL elements starting at e0, element innermost.
+// Stages 2 and 6 (basis loads) are element independent and reused as is.
+//
+#define DIFFUSION3DPA_0_CPU_SIMD                                               \
+  constexpr Index_type MQ1 = diff::Q1D;                                        \
+  constexpr Index_type MD1 = diff::D1D;                                        \
+  constexpr Index_type MDQ = (MQ1 > MD1) ? MQ1 : MD1;                          \
+  constexpr Index_type VL = FEM_VL;                                            \
+  FEM_BATCH_SETUP(e0, NE);                                                     \
+  Real_type sBG[MQ1 * MD1];                                                    \
+  Real_type(*B)[MD1] = (Real_type(*)[MD1])sBG;                                 \
+  Real_type(*G)[MD1] = (Real_type(*)[MD1])sBG;                                 \
+  Real_type(*Bt)[MQ1] = (Real_type(*)[MQ1])sBG;                                \
+  Real_type(*Gt)[MQ1] = (Real_type(*)[MQ1])sBG;                                \
+  Real_type sm0[3][MDQ * MDQ * MDQ][VL];                                       \
+  Real_type sm1[3][MDQ * MDQ * MDQ][VL];                                       \
+  Real_type(*s_X)[MD1][MD1][VL] = (Real_type(*)[MD1][MD1][VL])(sm0 + 2);       \
+  Real_type(*DDQ0)[MD1][MQ1][VL] = (Real_type(*)[MD1][MQ1][VL])(sm0 + 0);      \
+  Real_type(*DDQ1)[MD1][MQ1][VL] = (Real_type(*)[MD1][MQ1][VL])(sm0 + 1);      \
+  Real_type(*DQQ0)[MQ1][MQ1][VL] = (Real_type(*)[MQ1][MQ1][VL])(sm1 + 0);      \
+  Real_type(*DQQ1)[MQ1][MQ1][VL] = (Real_type(*)[MQ1][MQ1][VL])(sm1 + 1);      \
+  Real_type(*DQQ2)[MQ1][MQ1][VL] = (Real_type(*)[MQ1][MQ1][VL])(sm1 + 2);      \
+  Real_type(*QQQ0)[MQ1][MQ1][VL] = (Real_type(*)[MQ1][MQ1][VL])(sm0 + 0);      \
+  Real_type(*QQQ1)[MQ1][MQ1][VL] = (Real_type(*)[MQ1][MQ1][VL])(sm0 + 1);      \
+  Real_type(*QQQ2)[MQ1][MQ1][VL] = (Real_type(*)[MQ1][MQ1][VL])(sm0 + 2);      \
+  Real_type(*QQD0)[MQ1][MD1][VL] = (Real_type(*)[MQ1][MD1][VL])(sm1 + 0);      \
+  Real_type(*QQD1)[MQ1][MD1][VL] = (Real_type(*)[MQ1][MD1][VL])(sm1 + 1);      \
+  Real_type(*QQD2)[MQ1][MD1][VL] = (Real_type(*)[MQ1][MD1][VL])(sm1 + 2);      \
+  Real_type(*QDD0)[MD1][MD1][VL] = (Real_type(*)[MD1][MD1][VL])(sm0 + 0);      \
+  Real_type(*QDD1)[MD1][MD1][VL] = (Real_type(*)[MD1][MD1][VL])(sm0 + 1);      \
+  Real_type(*QDD2)[MD1][MD1][VL] = (Real_type(*)[MD1][MD1][VL])(sm0 + 2);
+
+// gather AoS -> SoA
+#define DIFFUSION3DPA_SIMD_1                                                   \
+  CPU_FOREACH_LANE(l) {                                                        \
+    s_X[dz][dy][dx][l] = DPA_X(dx, dy, dz, le[l]);                             \
+  }
+
+#define DIFFUSION3DPA_SIMD_3                                                   \
+  CPU_FOREACH_LANE(l) {                                                        \
+    Real_type u = 0.0, v = 0.0;                                                \
+    for (Index_type dx = 0; dx < diff::D1D; ++dx) {                            \
+      const Real_type coords = s_X[dz][dy][dx][l];                             \
+      u += coords * B[qx][dx];                                                 \
+      v += coords * G[qx][dx];                                                 \
+    }                                                                          \
+    DDQ0[dz][dy][qx][l] = u;                                                   \
+    DDQ1[dz][dy][qx][l] = v;                                                   \
+  }
+
+#define DIFFUSION3DPA_SIMD_4                                                   \
+  CPU_FOREACH_LANE(l) {                                                        \
+    Real_type u = 0.0, v = 0.0, w = 0.0;                                       \
+    for (Index_type dy = 0; dy < diff::D1D; ++dy) {                            \
+      u += DDQ1[dz][dy][qx][l] * B[qy][dy];                                    \
+      v += DDQ0[dz][dy][qx][l] * G[qy][dy];                                    \
+      w += DDQ0[dz][dy][qx][l] * B[qy][dy];                                    \
+    }                                                                          \
+    DQQ0[dz][qy][qx][l] = u;                                                   \
+    DQQ1[dz][qy][qx][l] = v;                                                   \
+    DQQ2[dz][qy][qx][l] = w;                                                   \
+  }
+
+#define DIFFUSION3DPA_SIMD_5                                                   \
+  CPU_FOREACH_LANE(l) {                                                        \
+    Real_type u = 0.0, v = 0.0, w = 0.0;                                       \
+    for (Index_type dz = 0; dz < diff::D1D; ++dz) {                            \
+      u += DQQ0[dz][qy][qx][l] * B[qz][dz];                                    \
+      v += DQQ1[dz][qy][qx][l] * B[qz][dz];                                    \
+      w += DQQ2[dz][qy][qx][l] * G[qz][dz];                                    \
+    }                                                                          \
+    const Index_type e = le[l];                                                \
+    const Real_type O11 = DPA_d(qx, qy, qz, 0, e);                             \
+    const Real_type O12 = DPA_d(qx, qy, qz, 1, e);                             \
+    const Real_type O13 = DPA_d(qx, qy, qz, 2, e);                             \
+    const Real_type O21 = symmetric ? O12 : DPA_d(qx, qy, qz, 3, e);           \
+    const Real_type O22 =                                                      \
+        symmetric ? DPA_d(qx, qy, qz, 3, e) : DPA_d(qx, qy, qz, 4, e);         \
+    const Real_type O23 =                                                      \
+        symmetric ? DPA_d(qx, qy, qz, 4, e) : DPA_d(qx, qy, qz, 5, e);         \
+    const Real_type O31 = symmetric ? O13 : DPA_d(qx, qy, qz, 6, e);           \
+    const Real_type O32 = symmetric ? O23 : DPA_d(qx, qy, qz, 7, e);           \
+    const Real_type O33 =                                                      \
+        symmetric ? DPA_d(qx, qy, qz, 5, e) : DPA_d(qx, qy, qz, 8, e);         \
+    QQQ0[qz][qy][qx][l] = (O11 * u) + (O12 * v) + (O13 * w);                   \
+    QQQ1[qz][qy][qx][l] = (O21 * u) + (O22 * v) + (O23 * w);                   \
+    QQQ2[qz][qy][qx][l] = (O31 * u) + (O32 * v) + (O33 * w);                   \
+  }
+
+#define DIFFUSION3DPA_SIMD_7                                                   \
+  CPU_FOREACH_LANE(l) {                                                        \
+    Real_type u = 0.0, v = 0.0, w = 0.0;                                       \
+    for (Index_type qx = 0; qx < diff::Q1D; ++qx) {                            \
+      u += QQQ0[qz][qy][qx][l] * Gt[dx][qx];                                   \
+      v += QQQ1[qz][qy][qx][l] * Bt[dx][qx];                                   \
+      w += QQQ2[qz][qy][qx][l] * Bt[dx][qx];                                   \
+    }                                                                          \
+    QQD0[qz][qy][dx][l] = u;                                                   \
+    QQD1[qz][qy][dx][l] = v;                                                   \
+    QQD2[qz][qy][dx][l] = w;                                                   \
+  }
+
+#define DIFFUSION3DPA_SIMD_8                                                   \
+  CPU_FOREACH_LANE(l) {                                                        \
+    Real_type u = 0.0, v = 0.0, w = 0.0;                                       \
+    for (Index_type qy = 0; qy < diff::Q1D; ++qy) {                            \
+      u += QQD0[qz][qy][dx][l] * Bt[dy][qy];                                   \
+      v += QQD1[qz][qy][dx][l] * Gt[dy][qy];                                   \
+      w += QQD2[qz][qy][dx][l] * Bt[dy][qy];                                   \
+    }                                                                          \
+    QDD0[qz][dy][dx][l] = u;                                                   \
+    QDD1[qz][dy][dx][l] = v;                                                   \
+    QDD2[qz][dy][dx][l] = w;                                                   \
+  }
+
+// scatter SoA -> AoS (valid lanes only)
+#define DIFFUSION3DPA_SIMD_9                                                   \
+  CPU_FOREACH_LANE(l) {                                                        \
+    Real_type u = 0.0, v = 0.0, w = 0.0;                                       \
+    for (Index_type qz = 0; qz < diff::Q1D; ++qz) {                            \
+      u += QDD0[qz][dy][dx][l] * Bt[dz][qz];                                   \
+      v += QDD1[qz][dy][dx][l] * Bt[dz][qz];                                   \
+      w += QDD2[qz][dy][dx][l] * Gt[dz][qz];                                   \
+    }                                                                          \
+    if (l < nel) {                                                             \
+      const Index_type e = e0 + l;                                             \
+      DPA_Y(dx, dy, dz, e) += (u + v + w);                                     \
+    }                                                                          \
+  }
+
 namespace rajaperf {
 class RunParams;
 
