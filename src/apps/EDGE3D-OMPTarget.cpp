@@ -50,8 +50,8 @@ void EDGE3D::runOpenMPTargetVariant(VariantID vid)
                                        z0,z1,z2,z3,z4,z5,z6,z7, \
                                        sum) device( did )
       #pragma omp teams distribute parallel for thread_limit(threads_per_team) schedule(static, 1)
-      for (Index_type i = ibegin ; i < iend ; ++i ) {
-        EDGE3D_BODY;
+      for (Index_type i0 = ibegin ; i0 < iend ; i0 += EDGE3D_VL ) {
+        EDGE3D_SIMD_BODY;
       }
       RP_CALI_SUBKERNEL_END("EDGE3D_1");
 
@@ -68,8 +68,8 @@ void EDGE3D::runOpenMPTargetVariant(VariantID vid)
 
       RP_CALI_SUBKERNEL_BEGIN("EDGE3D_1");
       RAJA::forall<RAJA::omp_target_parallel_for_exec<threads_per_team>>( res,
-        RAJA::RangeSegment(ibegin, iend), [=](Index_type i) {
-        EDGE3D_BODY;
+        RAJA::RangeStrideSegment(ibegin, iend, EDGE3D_VL), [=](Index_type i0) {
+        EDGE3D_SIMD_BODY;
       });
       RP_CALI_SUBKERNEL_END("EDGE3D_1");
 

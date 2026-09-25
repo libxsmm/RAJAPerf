@@ -32,8 +32,8 @@ void EDGE3D::runOpenMPVariant(VariantID vid)
   EDGE3D_DATA_SETUP;
 
   auto edge3d_lam =
-    [=](Index_type i) {
-      EDGE3D_BODY;
+    [=](Index_type i0) {
+      EDGE3D_SIMD_BODY;
     };
 
   switch ( vid ) {
@@ -46,8 +46,8 @@ void EDGE3D::runOpenMPVariant(VariantID vid)
 
         RP_CALI_SUBKERNEL_BEGIN("EDGE3D_1");
         #pragma omp parallel for
-        for (Index_type i = ibegin ; i < iend ; ++i ) {
-          EDGE3D_BODY;
+        for (Index_type i0 = ibegin ; i0 < iend ; i0 += EDGE3D_VL ) {
+          EDGE3D_SIMD_BODY;
         }
         RP_CALI_SUBKERNEL_END("EDGE3D_1");
 
@@ -65,8 +65,8 @@ void EDGE3D::runOpenMPVariant(VariantID vid)
 
         RP_CALI_SUBKERNEL_BEGIN("EDGE3D_1");
         #pragma omp parallel for
-        for (Index_type i = ibegin ; i < iend ; ++i ) {
-          edge3d_lam(i);
+        for (Index_type i0 = ibegin ; i0 < iend ; i0 += EDGE3D_VL ) {
+          edge3d_lam(i0);
         }
         RP_CALI_SUBKERNEL_END("EDGE3D_1");
 
@@ -86,7 +86,7 @@ void EDGE3D::runOpenMPVariant(VariantID vid)
 
         RP_CALI_SUBKERNEL_BEGIN("EDGE3D_1");
         RAJA::forall<RAJA::omp_parallel_for_exec>( res,
-          RAJA::RangeSegment(ibegin, iend), edge3d_lam);
+          RAJA::RangeStrideSegment(ibegin, iend, EDGE3D_VL), edge3d_lam);
         RP_CALI_SUBKERNEL_END("EDGE3D_1");
 
       }
