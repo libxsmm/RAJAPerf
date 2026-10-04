@@ -26,6 +26,9 @@
 // large per-batch kernels: one out-of-line copy shared by all variants
 #define RAJAPERF_FEM_NOINLINE inline __attribute__((noinline))
 
+// for lambda bodies, e.g. the ones passed to static_for: [&](auto I) ATTR {...}
+#define RAJAPERF_FEM_LAMBDA_INLINE __attribute__((always_inline))
+
 // Keeps an alignas(64) local in memory, which makes clang realign the frame;
 // otherwise zmm spills use caller-dependent (possibly line-splitting) slots.
 #define RAJAPERF_FEM_STACK_ALIGN(a) asm volatile("" : : "r"(a))
@@ -70,6 +73,52 @@ RAJA_INLINE Real_type vhsum(vd a) { return _mm512_reduce_add_pd(a); }
 RAJA_INLINE vmask lane_mask(Index_type n) {
   return static_cast<vmask>((n >= 8) ? 0xFF : ((1u << n) - 1u));
 }
+
+// (a < b) ? x : y per lane
+RAJA_INLINE vd vsel_lt(vd a, vd b, vd x, vd y) {
+  return _mm512_mask_blend_pd(_mm512_cmp_pd_mask(a, b, _CMP_LT_OQ), y, x);
+}
+
+// NV independent 8-lane vectors in lockstep (8*NV elements): every operation
+// issues NV independent instructions, i.e. NV-way ILP per dependency chain.
+template <int NV>
+struct vdx {
+  vd r[NV];
+};
+
+template <int NV>
+RAJA_INLINE vdx<NV> vsplat(vd a) {
+  vdx<NV> o;
+  RAJAPERF_FEM_UNROLL
+  for (int k = 0; k < NV; ++k) {
+    o.r[k] = a;
+  }
+  return o;
+}
+
+#define RAJAPERF_FEM_VDX_OP(op, PARAMS, ARGS)                                \
+  template <int NV>                                                          \
+  RAJA_INLINE vdx<NV> op PARAMS {                                            \
+    vdx<NV> o;                                                               \
+    RAJAPERF_FEM_UNROLL                                                      \
+    for (int k = 0; k < NV; ++k) {                                           \
+      o.r[k] = op ARGS;                                                      \
+    }                                                                        \
+    return o;                                                                \
+  }
+
+RAJAPERF_FEM_VDX_OP(vabs, (vdx<NV> a), (a.r[k]))
+RAJAPERF_FEM_VDX_OP(vadd, (vdx<NV> a, vdx<NV> b), (a.r[k], b.r[k]))
+RAJAPERF_FEM_VDX_OP(vsub, (vdx<NV> a, vdx<NV> b), (a.r[k], b.r[k]))
+RAJAPERF_FEM_VDX_OP(vmul, (vdx<NV> a, vdx<NV> b), (a.r[k], b.r[k]))
+RAJAPERF_FEM_VDX_OP(vdiv, (vdx<NV> a, vdx<NV> b), (a.r[k], b.r[k]))
+RAJAPERF_FEM_VDX_OP(vfma, (vdx<NV> a, vdx<NV> b, vdx<NV> c),
+                    (a.r[k], b.r[k], c.r[k]))
+RAJAPERF_FEM_VDX_OP(vfms, (vdx<NV> a, vdx<NV> b, vdx<NV> c),
+                    (a.r[k], b.r[k], c.r[k]))
+RAJAPERF_FEM_VDX_OP(vsel_lt, (vdx<NV> a, vdx<NV> b, vdx<NV> x, vdx<NV> y),
+                    (a.r[k], b.r[k], x.r[k], y.r[k]))
+#undef RAJAPERF_FEM_VDX_OP
 
 // In-register 8x8 transpose: r[i][j] -> r[j][i].
 RAJA_INLINE void transpose8(vd (&r)[8]) {
@@ -253,9 +302,21 @@ RAJA_INLINE void mass_pa_apply(const Real_type (&b)[Q1][D1],
 #endif
 
 #include <cstdint>
+#include <type_traits>
+#include <utility>
 
 namespace rajaperf {
 namespace fem_simd {
+
+// f(std::integral_constant<int, I>{}) for I = 0..N-1: compile-time loop indices
+template <class F, int... I>
+RAJA_INLINE void static_for_impl(F &&f, std::integer_sequence<int, I...>) {
+  (f(std::integral_constant<int, I>{}), ...);
+}
+template <int N, class F>
+RAJA_INLINE void static_for(F &&f) {
+  static_for_impl(f, std::make_integer_sequence<int, N>{});
+}
 
 RAJA_INLINE bool is_aligned64(const void *p) {
   return (reinterpret_cast<std::uintptr_t>(p) & 63u) == 0;
