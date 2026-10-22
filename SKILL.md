@@ -1,6 +1,6 @@
 ---
 name: hpc-kernel-optimization
-description: 'Staged CPU optimization workflow for HPC loop kernels (finite element, stencil, streaming, geometry, many small dense solves). Use when: optimizing or vectorizing a compute kernel; deciding if a kernel is compute, memory, latency or cache bound; roofline analysis; AoS to SoA conversion or element batching; removing atomics; loop fusion; sum factorization; algebraic reformulation; SIMD intrinsics (AVX-512, AVX2, SVE, NEON); forcing FMA; streaming or non-temporal stores; checking whether GFLOP/s or GB/s above peak is real; comparing an optimized branch against a baseline.'
+description: 'Staged CPU optimization workflow for HPC loop kernels (finite element, stencil, streaming, geometry, many small dense solves). Use when: optimizing or vectorizing a compute kernel; deciding if a kernel is compute, memory, latency or cache bound; roofline analysis; AoS to SoA conversion or element batching; removing atomics; loop fusion; sum factorization; algebraic reformulation; GEMM-like register blocking of small matrix assembly; multi-vector batches for ILP; SIMD intrinsics (AVX-512, AVX2, SVE, NEON); forcing FMA; streaming or non-temporal stores; checking whether GFLOP/s or GB/s above peak is real; comparing an optimized branch against a baseline.'
 ---
 
 # HPC Kernel Optimization Strategy
@@ -70,6 +70,7 @@ Collect these numbers for every kernel before changing code:
 | **Hardware FLOPs** | PMU counters, e.g. `perf stat -e fp_arith_inst_retired.{scalar,128b_packed,256b_packed,512b_packed}_double` (weights 1, 2, 4, 8; FMA already counts 2) | a nominal/hardware ratio above 1 means the nominal model overstates the real work |
 | Vector share | wide-vector fraction of hardware FLOPs | low share means the code did not vectorize |
 | Working set vs LLC | sum of touched array sizes | GB/s above DRAM peak means cache-resident, not a bandwidth win |
+| Instruction mix per item | perf counts of loads, stores, FP instructions, divider cycles and per-port uops on one pinned core; subtract a 1x-reps run from a 3x-reps run and divide by items or batches | a high store/FP ratio means intermediates go through memory (register-block them); saturated FP ports with few loads/stores means only less work helps |
 | Thread scaling | t(1) / t(N) | far below N points to bandwidth or serialization (atomics, critical sections) |
 | Size sweep | 3–4 sizes spanning the LLC | a speedup that collapses once data leaves the LLC is the memory-bound signature |
 | Compiler remarks | `-Rpass=loop-vectorize -Rpass-missed=loop-vectorize -Rpass-analysis=loop-vectorize` (clang), `-fopt-info-vec-all` (gcc) | shows which loops did not vectorize and why |
@@ -134,6 +135,15 @@ index, and has no cross-lane dependencies or serialization.
      too.
    - Index macros that do not parenthesize their arguments break when passed
      expressions like `e0 + l`. Pass a plain variable.
+   - `omp simd` lane loops must not store into escaped memory (a buffer
+     passed to `asm volatile`, or a function parameter): the vectorizer
+     gives up. Compute into a local temporary and copy it out in a
+     separate loop.
+   - Compile-time loops via lambdas (`static_for`): intrinsics code needs
+     the lambdas forced inline (`__attribute__((always_inline))`), otherwise
+     they are emitted out of line. In plain-C `omp simd` lane loops, forcing
+     them inline can *break* vectorization ("too many memory checks"); leave
+     normal inlining there.
 5. **Verify.** Run the random-input harness, check the vectorization
    remarks, and inspect the assembly.
 
@@ -148,6 +158,7 @@ usually beats everything else. Patterns that generalize:
 | **Sum factorization** | tensor-product structure, e.g. $\sum_q \prod_d B_{i_d q_d} B_{j_d q_d}\, D_q$ evaluated naively | contract one dimension at a time; work goes from $O(p^{2d} q^d)$ to roughly $O(p^{d+1} q^d)$; the saving grows with order and dimension |
 | **Metric / algebraic reformulation** | every basis function or vector is transformed by the same Jacobian at each quadrature point | transform the *metric* once per point ($G = J^T J/\det J$, $H = \det J\, J^{-1}J^{-T}$) and contract with the untransformed reference basis; exploit its sparsity; each entry becomes a few FMAs |
 | **Share work across outputs** | the same input is processed separately against several neighbouring targets (e.g. clipping one cell against each of its $2^d$ overlapping cells) | split once by the shared planes or boundaries so each piece goes to exactly one target; skip copies when a piece lies entirely on one side |
+| **GEMM-like reordering of small matrix assembly** | a per-item matrix accumulated as $M_{pm} \mathrel{+}= \sum_q f(q,p,m)$ with the $q$ loop outermost, so every entry is loaded and stored once per $q$ | two phases: compute the few per-$q$ coefficients for all $q$ first, then contract over $q$ tile by tile with accumulators in registers (see 4c); stores drop from once per $q$ to once per entry |
 | **Gather instead of scatter** | many-to-one accumulation with atomics | no atomics, full parallelism, vectorizable |
 | **Batch independent problems** | many tiny identical solves | SIMD across problems |
 | Symmetry | $M_{ij} = M_{ji}$ and similar | compute half |
@@ -193,7 +204,8 @@ store or gather inefficiency, after stages 2 and 3.
   `fma(w*x, x, acc)`.
 - **Register blocking.** Keep an output tile of accumulators in registers
   across the whole reduction, and broadcast shared coefficients. Stay under
-  the architectural register count (32 on AVX-512) to avoid spills.
+  the architectural register count (32 on AVX-512) to avoid spills. For
+  small per-item matrices see 4c.
 - **Full unrolling** of fixed-size loops, so every table index is a
   compile-time constant. Without it, kernels become IPC bound on address
   arithmetic.
@@ -207,7 +219,64 @@ store or gather inefficiency, after stages 2 and 3.
 - **Check the assembly:** no spills in the hot loop, a high FMA share, and
   no unexpected gathers.
 
-### 4c. Streaming (non-temporal) stores
+### 4c. GEMM-style register-blocked contractions
+
+For kernels that build a small dense matrix per item (element matrices,
+local operators) as a sum over quadrature points or samples $q$:
+
+$$M_{pm} = \sum_q \Big( a_p(q)\, a_m(q)\, g(q) + b_p(q)^T H(q)\, b_m(q) \Big)$$
+
+The natural loop order (for each $q$: update every $M_{pm}$) streams the
+whole matrix through L1 once per $q$ and is store bound. Reorder it like a
+GEMM, with $q$ as the reduction dimension $K$ and the batch of items in the
+SIMD lanes:
+
+1. **Phase 1, per-$q$ coefficients.** For every $q$, compute the few
+   item-dependent terms ($g$, the entries of $H$, ...) for the whole batch
+   and store them in a small aligned stack buffer `W[q][k][VL]`. The $q$
+   iterations are independent, so this phase has plenty of ILP.
+2. **Phase 2, tiled contraction.** Loop over output tiles; for each tile,
+   zero the accumulators, loop over all $q$, and write the tile once at the
+   end.
+   - Per $q$ and tile, load only the coefficient terms that tile needs.
+   - Item-independent factors ($a_p$, $b_p$, quadrature weights) come from
+     a table and are **broadcast**, like the B operand of a GEMM
+     micro-kernel.
+   - Precompute per-column products (e.g. $H b_m$) once per $q$ and tile,
+     then each entry update is a short FMA chain.
+3. **Size the tile to the register file.** Accumulators plus per-column
+   operands must fit (e.g. 4×4 = 16 accumulators + 8 operands on 32 zmm).
+   With NV vectors per value (see 4d), shrink the tile to keep the register
+   count constant, e.g. 4×(4/NV).
+4. **Exploit symmetry** at compile time: visit only upper-triangle tiles and
+   drop lower entries of diagonal tiles via constant-folded conditions
+   (`if constexpr`, fully unrolled tile loops).
+5. **Build item-independent tables once per run** (a struct constructed in
+   setup), not per batch.
+6. **Write it in plain C first** (`[k][VL]` arrays, `omp simd` lane loops),
+   then in intrinsics, with the same structure.
+
+Verify with the instruction-mix counters from stage 1: the store/FP ratio
+should drop sharply and the kernel should end up FP-throughput bound.
+
+### 4d. Multi-vector batches for ILP
+
+When long dependency chains (divides, determinants, short reductions) leave
+the FP units idle, hold each value as NV independent vector registers
+(a small `vdx<NV>` struct with overloaded ops) and process VL×NV items per
+batch. Each instruction then has NV independent copies in flight.
+
+- Shrink register tiles by NV (see 4c) to avoid spills.
+- **Do not fully unroll large loops at NV > 1.** The code size can exceed
+  the L1i / decoded-uop cache and the kernel becomes front-end bound.
+  Keep outer loops (e.g. over quadrature points) rolled, or make the unroll
+  count depend on NV (`clang loop unroll_count(N)` accepts a constexpr).
+- Share the batch prelude (gather with tail replication, common geometry)
+  between kernels as an inlined helper templated on NV.
+- Register as separate tunings (`_x2`, `_x4`) and measure; the best NV
+  depends on the kernel and machine.
+
+### 4e. Streaming (non-temporal) stores
 Use them only when the output is **write-only, written in full cache lines,
 and larger than the LLC**. They avoid the read-for-ownership and cache
 pollution.
