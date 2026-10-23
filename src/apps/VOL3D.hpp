@@ -170,6 +170,8 @@ public:
 
   void runSeqVariant(VariantID vid);
   void runOpenMPVariant(VariantID vid);
+  template < size_t tune_idx >
+  void runOpenMPVariantTuned(VariantID vid);
   void runOpenMPTargetVariant(VariantID vid);
 
   template < size_t block_size >

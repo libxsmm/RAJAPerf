@@ -19,12 +19,56 @@
 namespace rajaperf {
 namespace apps {
 
+// tune_idx 0: default; 1: AVX-512 batches with in-register transposes
+template <size_t tune_idx>
 void DIFFUSION3DPA::runOpenMPVariant(VariantID vid) {
 
 #if defined(RAJA_ENABLE_OPENMP) && defined(RUN_OPENMP)
 
   const Index_type run_reps = getRunReps();
   DIFFUSION3DPA_DATA_SETUP;
+
+#if defined(RAJAPERF_FEM_AVX512)
+  if constexpr (tune_idx == 1) {
+
+    switch (vid) {
+
+    case Base_OpenMP: {
+      startTimer();
+      // Loop counter increment uses macro to quiet C++20 compiler warning
+      for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
+        #pragma omp parallel for
+        for (Index_type e0 = 0; e0 < NE; e0 += FEM_VL) {
+          diffusion3dpa_batch_avx512(Basis, dBasis, D, X, Y, e0,
+                                     (NE - e0 < FEM_VL) ? NE - e0 : FEM_VL, NE);
+        }
+      }
+      stopTimer();
+      break;
+    }
+
+    case RAJA_OpenMP: {
+      auto res{getHostResource()};
+      startTimer();
+      // Loop counter increment uses macro to quiet C++20 compiler warning
+      for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
+        RAJA::forall<RAJA::omp_parallel_for_exec>( res,
+          RAJA::RangeStrideSegment(0, NE, FEM_VL), [=](Index_type e0) {
+            diffusion3dpa_batch_avx512(Basis, dBasis, D, X, Y, e0,
+                                       (NE - e0 < FEM_VL) ? NE - e0 : FEM_VL, NE);
+          });
+      }
+      stopTimer();
+      break;
+    }
+
+    default:
+      getCout() << "\n DIFFUSION3DPA : Unknown OpenMP variant id = " << vid
+                << std::endl;
+    }
+    return;
+  }
+#endif
 
   switch (vid) {
 
@@ -332,7 +376,15 @@ RP_CALI_SUBKERNEL_END("DIFFUSION3DPA_1");
 #endif
 }
 
-RAJAPERF_DEFAULT_TUNING_DEFINE_BOILERPLATE(DIFFUSION3DPA, OpenMP, Base_OpenMP, RAJA_OpenMP)
+void DIFFUSION3DPA::defineOpenMPVariantTunings()
+{
+  for (VariantID vid : {Base_OpenMP, RAJA_OpenMP}) {
+    addVariantTuning<&DIFFUSION3DPA::runOpenMPVariant<0>>(vid, getDefaultTuningName());
+#if defined(RAJAPERF_FEM_AVX512)
+    addVariantTuning<&DIFFUSION3DPA::runOpenMPVariant<1>>(vid, "transpose");
+#endif
+  }
+}
 
 } // end namespace apps
 } // end namespace rajaperf

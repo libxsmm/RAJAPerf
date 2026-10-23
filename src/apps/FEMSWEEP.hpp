@@ -180,6 +180,9 @@ constexpr long FDS = 4;  // number of DOFs per face
 
 #define FEMSWEEP_KERNEL_HYPERPLANE_ELEMENT_SIMD \
   const Index_type e = order_r[k + nehp_pos + a * ne]; \
+  FEMSWEEP_ELEMENT_SIMD_BODY
+
+#define FEMSWEEP_ELEMENT_SIMD_BODY \
   Real_type b[ND][FEM_VL]; \
   for (Index_type j = 0; j < ND; ++j) \
   { \
@@ -531,7 +534,7 @@ inline void femsweep_team_shape(Index_type ntasks, int nthreads,
     const int team = (slot) / team_size; \
     const int rank = (slot) % team_size; \
     if (team < nteams) { \
-      int local_sense = 0; \
+      int local_sense = team_barriers[team].sense.load(std::memory_order_relaxed); \
       for (Index_type t = team; t < na * nbg; t += nteams) { \
         const Index_type a = t / nbg; \
         const Index_type g0 = (t % nbg) * FEM_VL; \
@@ -548,6 +551,225 @@ inline void femsweep_team_shape(Index_type ntasks, int nthreads,
       } \
     } \
   }
+
+// Kernel data for femsweep_element.
+struct FemsweepData
+{
+  Real_const_ptr Bdat, Adat, Fdat, Sgdat, M0dat;
+  Real_ptr Xdat;
+  const Index_type *AngleElem2FaceType, *elem_to_faces, *F_g2l, *idx1, *idx2;
+  Index_type ne, ng, sharedinteriorfaces;
+};
+
+// Prefetch what femsweep_element reads and writes for element e.
+RAJA_INLINE void femsweep_prefetch(const FemsweepData& d, const Index_type e,
+                                   const Index_type a, const Index_type g0,
+                                   const Index_type nel)
+{
+  const Index_type ne = d.ne;
+  const Real_type *const A = d.Adat + e * ND * ND + a * ne * ND * ND;
+  const Real_type *const M = d.M0dat + e * ND * ND;
+  for (Index_type c = 0; c < ND * ND; c += 8) {
+    __builtin_prefetch(A + c, 0, 3);
+    __builtin_prefetch(M + c, 0, 3);
+  }
+  __builtin_prefetch(d.Bdat + e * ND + a * ne * ND, 0, 3);
+  const Index_type *const ft = d.AngleElem2FaceType + e * NLF + a * ne * NLF;
+  for (Index_type face = 0; face < NLF; ++face) {
+    const Index_type sf_gl = d.F_g2l[d.elem_to_faces[NLF * e + face]];
+    if (ft[face] == 0 || sf_gl < 0) {
+      continue;
+    }
+    const Index_type s = (e == d.idx1[sf_gl * FDS] / ND) ? 0 : 1;
+    const Real_type *const Ff = d.Fdat + (s ^ 1) * FDS * FDS + sf_gl * 2 * FDS * FDS +
+                                a * d.sharedinteriorfaces * 2 * FDS * FDS;
+    __builtin_prefetch(Ff, 0, 3);
+    __builtin_prefetch(Ff + 8, 0, 3);
+  }
+  Real_type *const X = d.Xdat + (a * d.ng + g0) * ND * ne + e * ND;
+  for (Index_type l = 0; l < nel; ++l) {
+    __builtin_prefetch(X + l * ND * ne, 1, 3);
+    __builtin_prefetch(d.Sgdat + e + (g0 + l) * ne, 0, 3);
+  }
+}
+
+//
+// FEMSWEEP_ELEMENT_SIMD_BODY for element e (angle a, groups [g0, g0+nel)) in
+// an out-of-line function with an aligned frame: the LU spills to aligned
+// slots, face unknowns are gathered once per face, and x is written as one
+// contiguous row per group.
+//
+RAJAPERF_FEM_NOINLINE void femsweep_element(const FemsweepData& d,
+                                            const Index_type e,
+                                            const Index_type a,
+                                            const Index_type g0,
+                                            const Index_type nel,
+                                            const Real_type Ffactor)
+{
+  const Index_type ne = d.ne, ng = d.ng;
+  const Index_type sharedinteriorfaces = d.sharedinteriorfaces;
+  const Index_type *const AngleElem2FaceType = d.AngleElem2FaceType;
+  const Index_type *const elem_to_faces = d.elem_to_faces;
+  const Index_type *const F_g2l = d.F_g2l;
+  const Index_type *const idx1 = d.idx1;
+  const Index_type *const idx2 = d.idx2;
+#if defined(RAJAPERF_FEM_AVX512)
+  using namespace fem_simd;
+  const Index_type xa = a * ng * ND * ne;
+  // lane l -> group g0 + min(l, nel - 1)
+  const __m512i lg = _mm512_add_epi64(
+    _mm512_min_epi64(_mm512_set_epi64(7, 6, 5, 4, 3, 2, 1, 0),
+                     _mm512_set1_epi64(nel - 1)),
+    _mm512_set1_epi64(g0));
+  const __m512i xoff = _mm512_mullo_epi64(lg, _mm512_set1_epi64(ND * ne));
+  const __m512i soff = _mm512_mullo_epi64(lg, _mm512_set1_epi64(ne));
+
+  alignas(64) vd b[ND];
+  RAJAPERF_FEM_STACK_ALIGN(b);
+  for (Index_type j = 0; j < ND; ++j) {
+    b[j] = vset1(d.Bdat[j + e * ND + a * ne * ND]);
+  }
+  for (Index_type face = 0; face < NLF; ++face) {
+    const Index_type sf_gl = F_g2l[elem_to_faces[NLF * e + face]];
+    const Index_type f = sf_gl >= 0 ? sf_gl : -1 - sf_gl;
+    const Index_type s = (e == idx1[f * FDS] / ND) ? 0 : 1;
+    if ((AngleElem2FaceType[face + e * NLF + a * ne * NLF] == 0) || (sf_gl < 0)) {
+      continue;
+    }
+    const Real_type *const Ff = d.Fdat + (s ^ 1) * FDS * FDS + f * 2 * FDS * FDS +
+                                a * sharedinteriorfaces * 2 * FDS * FDS;
+    vd xg[FDS];
+    RAJAPERF_FEM_UNROLL
+    for (Index_type i = 0; i < FDS; i++) {
+      const Index_type dis = s == 0 ? idx2[f * FDS + i] : idx1[f * FDS + i];
+      xg[i] = _mm512_i64gather_pd(xoff, d.Xdat + dis + xa, 8);
+    }
+    RAJAPERF_FEM_UNROLL
+    for (Index_type j = 0; j < FDS; ++j) {
+      const Index_type djs = s == 0 ? idx1[f * FDS + j] : idx2[f * FDS + j];
+      vd F = vzero();
+      RAJAPERF_FEM_UNROLL
+      for (Index_type i = 0; i < FDS; i++) {
+        F = vfma(vset1(Ffactor * Ff[i + j * FDS]), xg[i], F);
+      }
+      b[djs % ND] = vsub(b[djs % ND], F);
+    }
+  }
+
+  // SolveLinearSystemNxN_simd
+  const vd vs = _mm512_i64gather_pd(soff, d.Sgdat + e, 8);
+  const Real_type *const A = d.Adat + e * ND * ND + a * ne * ND * ND;
+  const Real_type *const M = d.M0dat + e * ND * ND;
+  vd LU[ND][ND];
+  RAJAPERF_FEM_UNROLL
+  for (Index_type ii = 0; ii < ND; ++ii) {
+    RAJAPERF_FEM_UNROLL
+    for (Index_type jj = 0; jj < ND; ++jj) {
+      LU[ii][jj] = vfma(vs, vset1(M[ii * ND + jj]), vset1(A[ii * ND + jj]));
+    }
+  }
+  vd rinv[ND];
+  RAJAPERF_FEM_UNROLL
+  for (Index_type ii = 0; ii < ND; ++ii) {
+    RAJAPERF_FEM_UNROLL
+    for (Index_type jj = ii; jj < ND; ++jj) {
+      vd sum = vzero();
+      RAJAPERF_FEM_UNROLL
+      for (Index_type kk = 0; kk < ii; ++kk) {
+        sum = vfma(LU[jj][kk], LU[kk][ii], sum);
+      }
+      LU[jj][ii] = vsub(LU[jj][ii], sum);
+    }
+    rinv[ii] = vdiv(vset1(1.0), LU[ii][ii]);
+    RAJAPERF_FEM_UNROLL
+    for (Index_type jj = ii + 1; jj < ND; ++jj) {
+      vd sum = vzero();
+      RAJAPERF_FEM_UNROLL
+      for (Index_type kk = 0; kk < ii; ++kk) {
+        sum = vfma(LU[ii][kk], LU[kk][jj], sum);
+      }
+      LU[ii][jj] = vmul(vsub(LU[ii][jj], sum), rinv[ii]);
+    }
+  }
+  vd D[ND];
+  RAJAPERF_FEM_UNROLL
+  for (Index_type ii = 0; ii < ND; ++ii) {
+    vd sum = vzero();
+    RAJAPERF_FEM_UNROLL
+    for (Index_type jj = 0; jj < ii; ++jj) {
+      sum = vfma(LU[ii][jj], D[jj], sum);
+    }
+    D[ii] = vmul(vsub(b[ii], sum), rinv[ii]);
+  }
+  vd xv[ND];
+  xv[ND - 1] = D[ND - 1];
+  RAJAPERF_FEM_UNROLL
+  for (Index_type ii = ND - 2; ii > -1; --ii) {
+    vd sum = vzero();
+    RAJAPERF_FEM_UNROLL
+    for (Index_type jj = ii + 1; jj < ND; ++jj) {
+      sum = vfma(LU[ii][jj], xv[jj], sum);
+    }
+    xv[ii] = vsub(D[ii], sum);
+  }
+
+  // lane (group) l of x is the contiguous row Xdat[e*ND .. e*ND+ND) of group g0+l
+  static_assert(ND == FEM_VL, "row transpose needs ND == FEM_VL");
+  transpose8(xv);
+  Real_type *const xe = d.Xdat + xa + g0 * ND * ne + e * ND;
+  for (Index_type l = 0; l < nel; ++l) {
+    vstore(xe + l * ND * ne, xv[l]);
+  }
+#else
+  RAJA_UNUSED_VAR(nel);
+  {
+  Real_const_ptr Bdat = d.Bdat;
+  Real_const_ptr Adat = d.Adat;
+  Real_const_ptr Fdat = d.Fdat;
+  Real_const_ptr Sgdat = d.Sgdat;
+  Real_const_ptr M0dat = d.M0dat;
+  Real_ptr Xdat = d.Xdat;
+  FEM_BATCH_SETUP(g0, ng);
+  FEMSWEEP_ELEMENT_SIMD_BODY
+  }
+#endif
+}
+
+// FEMSWEEP_TEAM_SWEEP with femsweep_element. Element data is scattered in
+// memory (DRAM latency bound), so the element pfd steps ahead in the sweep
+// order is prefetched first. Tasks [t_begin, t_end) are shared by nt_ teams of
+// ts_ threads with barriers bar_.
+#define FEMSWEEP_PF 2
+#define FEMSWEEP_TEAM_SWEEP_RANGE(slot, t_begin, t_end, ts_, nt_, bar_, pfd) \
+  { \
+    const int team = (slot) / (ts_); \
+    const int rank = (slot) % (ts_); \
+    if (team < (nt_)) { \
+      int local_sense = (bar_)[team].sense.load(std::memory_order_relaxed); \
+      for (Index_type t = (t_begin) + team; t < (t_end); t += (nt_)) { \
+        const Index_type a = t / nbg; \
+        const Index_type g0 = (t % nbg) * FEM_VL; \
+        FEMSWEEP_KERNEL_SETUP; \
+        const Index_type nel = (ng - g0 < FEM_VL) ? ng - g0 : FEM_VL; \
+        const Index_type* const orda = order_r + a * ne; \
+        Index_type nehp_pos = 0; \
+        for (Index_type hp = 0; hp < nhp; ++hp) { \
+          const Index_type nehp = phpaa_r[ohp + hp]; \
+          for (Index_type k = rank; k < nehp; k += (ts_)) { \
+            const Index_type p = nehp_pos + k + (pfd) * (ts_); \
+            if (p < ne) { femsweep_prefetch(fd, orda[p], a, g0, nel); } \
+            femsweep_element(fd, orda[nehp_pos + k], a, g0, nel, Ffactor); \
+          } \
+          if ((ts_) > 1) { (bar_)[team].wait((ts_), local_sense); } \
+          nehp_pos += nehp; \
+        } \
+      } \
+    } \
+  }
+
+#define FEMSWEEP_TEAM_SWEEP_PF(slot) \
+  FEMSWEEP_TEAM_SWEEP_RANGE(slot, 0, na * nbg, team_size, nteams, team_barriers, \
+                            FEMSWEEP_PF)
 
 
 class RunParams;
@@ -574,6 +796,7 @@ public:
   void defineHipVariantTunings();
 
   void runSeqVariant(VariantID vid);
+  template < size_t tune_idx >
   void runOpenMPVariant(VariantID vid);
 
   template < size_t block_size >

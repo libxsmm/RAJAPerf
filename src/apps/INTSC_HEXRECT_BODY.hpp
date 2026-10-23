@@ -641,10 +641,59 @@ RAJA_INLINE void intsc_split_or_pass
   hi = ( shi.n >= 3 ) ? &shi : nullptr ;
 }
 
+//   The part of p with c[axis] >= cut (KEEP_HI) or < cut, written to out with
+//   the vertices of the corresponding intsc_split_polygon side; only the
+//   valid vertices of the kept side are stored.
+template < bool KEEP_HI >
+RAJA_INLINE void intsc_clip_to
+    ( IntscPoly const& p, Int_type const axis, Real_type const cut,
+      IntscPoly& out )
+{
+  Int_type n = 0 ;
+  for ( Int_type k = 0 ; k < p.n ; ++k ) {
+    Int_type const j = ( k + 1 == p.n ) ? 0 : k + 1 ;
+    Real_type const a = p.c[axis][k], b = p.c[axis][j] ;
+    bool const alo = a < cut, blo = b < cut ;
+    if ( alo != KEEP_HI ) {
+      for ( Int_type d = 0 ; d < 3 ; ++d ) { out.c[d][n] = p.c[d][k] ; }
+      ++n ;
+    }
+    if ( alo != blo ) {
+      Real_type const eta = ( cut - a ) / ( b - a ) ;
+      for ( Int_type d = 0 ; d < 3 ; ++d ) {
+        out.c[d][n] = ( d == axis ) ? cut
+                    : p.c[d][k] + ( p.c[d][j] - p.c[d][k] ) * eta ;
+      }
+      ++n ;
+    }
+  }
+  out.n = n ;
+}
+
+//   One side of intsc_split_or_pass: p, out or null.
+template < bool KEEP_HI >
+RAJA_INLINE IntscPoly const* intsc_clip_or_pass
+    ( IntscPoly const& p, Int_type const axis, Real_type const cut,
+      IntscPoly& out )
+{
+  if ( p.n < 3 ) { return nullptr ; }
+  Real_type mn = p.c[axis][0], mx = mn ;
+  for ( Int_type k = 1 ; k < p.n ; ++k ) {
+    mn = ( p.c[axis][k] < mn ) ? p.c[axis][k] : mn ;
+    mx = ( p.c[axis][k] > mx ) ? p.c[axis][k] : mx ;
+  }
+  if ( mx < cut )  { return KEEP_HI ? nullptr : &p ; }
+  if ( mn >= cut ) { return KEEP_HI ? &p : nullptr ; }
+  intsc_clip_to<KEEP_HI>( p, axis, cut, out ) ;
+  return ( out.n >= 3 ) ? &out : nullptr ;
+}
+
 //   Add the column integral of polygon p (already inside the target's xy
 //   extent) over the target frame to the sums; heights are z - zt0, or dzt
 //   for a polygon projected to the target's top (PROJECT).
-template < bool PROJECT >
+//   LEAN: the frame transform is applied while integrating (same arithmetic
+//   as intsc24_shxf1) instead of staging the polygon in a q[] buffer.
+template < bool PROJECT, bool LEAN = false >
 RAJA_INLINE void intsc_add_polygon
     ( IntscPoly const& p,
       Real_type const xt0, Real_type const dtx, Real_type const a11,
@@ -653,6 +702,49 @@ RAJA_INLINE void intsc_add_polygon
       Real_type (&sums)[4] )
 {
   if ( p.n < 3 ) { return ; }
+  if constexpr ( LEAN ) {
+    Real_type const one3 = 0.33333333333333333 ;
+    auto tx = [&] ( Int_type k ) { return ( p.c[0][k] - xt0 ) * a11 ; } ;
+    auto ty = [&] ( Int_type k ) { return ( p.c[1][k] - yt0 ) * a22 ; } ;
+    auto tz = [&] ( Int_type k ) { return PROJECT ? dzt : p.c[2][k] - zt0 ; } ;
+    Real_type asum0 = 0.0, asumx = 0.0, asumy = 0.0, asumz = 0.0 ;
+    Real_type const xc0 = tx(0), yc0 = ty(0), zc0 = tz(0) ;
+    Real_type xc1 = tx(1), yc1 = ty(1), zc1 = tz(1) ;
+    for ( Int_type kk = 2 ; kk < p.n ; kk++ ) {
+      Real_type const xc2 = tx(kk), yc2 = ty(kk), zc2 = tz(kk) ;
+      Real_type s0tri = 0.0, sxtri = 0.0, sytri = 0.0, sztri = 0.0 ;
+      Real_type metfac ;
+      metfac = 0.5 * ( zc0 + zc1 ) ;
+      s0tri += metfac ;
+      sxtri += metfac * ( xt0 + 0.5 * dtx * ( xc0 + xc1 ) ) ;
+      sytri += metfac * ( yt0 + 0.5 * dty * ( yc0 + yc1 ) ) ;
+      sztri += metfac * ( zt0 + 0.5 * metfac ) ;
+      metfac = 0.5 * ( zc1 + zc2 ) ;
+      s0tri += metfac ;
+      sxtri += metfac * ( xt0 + 0.5 * dtx * ( xc1 + xc2 ) ) ;
+      sytri += metfac * ( yt0 + 0.5 * dty * ( yc1 + yc2 ) ) ;
+      sztri += metfac * ( zt0 + 0.5 * metfac ) ;
+      metfac = 0.5 * ( zc2 + zc0 ) ;
+      s0tri += metfac ;
+      sxtri += metfac * ( xt0 + 0.5 * dtx * ( xc2 + xc0 ) ) ;
+      sytri += metfac * ( yt0 + 0.5 * dty * ( yc2 + yc0 ) ) ;
+      sztri += metfac * ( zt0 + 0.5 * metfac ) ;
+      Real_type const area = 0.5 *
+          ( (xc0-xc1) * (yc0+yc1) + (xc1-xc2) * (yc1+yc2) +
+            (xc2-xc0) * (yc2+yc0) ) ;
+      asum0 += one3 * area * s0tri ;
+      asumx += one3 * area * sxtri ;
+      asumy += one3 * area * sytri ;
+      asumz += one3 * area * sztri ;
+      xc1 = xc2 ;  yc1 = yc2 ;  zc1 = zc2 ;
+    }
+    Real_type const det = dtx * dty ;
+    sums[0] += asum0 * det ;
+    sums[1] += asumx * det ;
+    sums[2] += asumy * det ;
+    sums[3] += asumz * det ;
+    return ;
+  }
   Real_type q[ 3*max_polygon_pts ] ;
   for ( Int_type k = 0 ; k < p.n ; ++k ) {
     q[k]                     = ( p.c[0][k] - xt0 ) * a11 ;
@@ -671,6 +763,9 @@ RAJA_INLINE void intsc_add_polygon
 //   Volume and moments of one donor hexahedron intersected with the 2x2x2
 //   target zones bounded by planes xp[0..2], yp[0..2], zp[0..2].
 //   out[r][0..3] for target r = ix + 2*iy + 4*iz.
+//   LEAN: clips write only the kept side's valid vertices into ping-pong
+//   buffers and polygons are integrated without staging copies.
+template < bool LEAN = false >
 RAJA_INLINE void intsc24_hex_split8
       ( Real_const_ptr xd, Real_const_ptr yd, Real_const_ptr zd,  // [8] donor
         Real_const_ptr xp, Real_const_ptr yp, Real_const_ptr zp,  // [3] planes
@@ -729,14 +824,24 @@ RAJA_INLINE void intsc24_hex_split8
            hi[2] < zp[0] ) {
         continue ;
       }
-      if ( lo[0] < xp[0] )  { intsc_clip_polygon<true >( tri, 0, xp[0] ) ; }
-      if ( hi[0] >= xp[2] ) { intsc_clip_polygon<false>( tri, 0, xp[2] ) ; }
-      if ( lo[1] < yp[0] )  { intsc_clip_polygon<true >( tri, 1, yp[0] ) ; }
-      if ( hi[1] >= yp[2] ) { intsc_clip_polygon<false>( tri, 1, yp[2] ) ; }
+      IntscPoly const* cur = &tri ;
+      IntscPoly cbuf[2] ;
+      if constexpr ( LEAN ) {
+        Int_type nb = 0 ;
+        if ( lo[0] < xp[0] )  { intsc_clip_to<true >( *cur, 0, xp[0], cbuf[nb] ) ; cur = &cbuf[nb] ; nb ^= 1 ; }
+        if ( hi[0] >= xp[2] ) { intsc_clip_to<false>( *cur, 0, xp[2], cbuf[nb] ) ; cur = &cbuf[nb] ; nb ^= 1 ; }
+        if ( lo[1] < yp[0] )  { intsc_clip_to<true >( *cur, 1, yp[0], cbuf[nb] ) ; cur = &cbuf[nb] ; nb ^= 1 ; }
+        if ( hi[1] >= yp[2] ) { intsc_clip_to<false>( *cur, 1, yp[2], cbuf[nb] ) ; cur = &cbuf[nb] ; }
+      } else {
+        if ( lo[0] < xp[0] )  { intsc_clip_polygon<true >( tri, 0, xp[0] ) ; }
+        if ( hi[0] >= xp[2] ) { intsc_clip_polygon<false>( tri, 0, xp[2] ) ; }
+        if ( lo[1] < yp[0] )  { intsc_clip_polygon<true >( tri, 1, yp[0] ) ; }
+        if ( hi[1] >= yp[2] ) { intsc_clip_polygon<false>( tri, 1, yp[2] ) ; }
+      }
 
       IntscPoly sx[2] ;
       IntscPoly const* px[2] ;
-      intsc_split_or_pass( tri, 0, xp[1], sx[0], sx[1], px[0], px[1] ) ;
+      intsc_split_or_pass( *cur, 0, xp[1], sx[0], sx[1], px[0], px[1] ) ;
 
       for ( Int_type ix = 0 ; ix < 2 ; ++ix ) {
         if ( px[ix] == nullptr ) { continue ; }
@@ -758,14 +863,18 @@ RAJA_INLINE void intsc24_hex_split8
           if ( pa != nullptr ) {
             IntscPoly sl, sh ;
             IntscPoly const *pl, *ph ;
-            intsc_split_or_pass( *pa, 2, zp[0], sl, sh, pl, ph ) ;
+            if constexpr ( LEAN ) {
+              ph = intsc_clip_or_pass<true>( *pa, 2, zp[0], sh ) ;
+            } else {
+              intsc_split_or_pass( *pa, 2, zp[0], sl, sh, pl, ph ) ;
+            }
             if ( ph != nullptr ) {
-              intsc_add_polygon<false>( *ph, xp[ix], dtx[ix], ax, yp[iy], dty[iy], ay,
+              intsc_add_polygon<false, LEAN>( *ph, xp[ix], dtx[ix], ax, yp[iy], dty[iy], ay,
                                         zp[0], dzt[0], s0 ) ;
             }
           }
           if ( pb != nullptr ) {
-            intsc_add_polygon<true>( *pb, xp[ix], dtx[ix], ax, yp[iy], dty[iy], ay,
+            intsc_add_polygon<true, LEAN>( *pb, xp[ix], dtx[ix], ax, yp[iy], dty[iy], ay,
                                      zp[0], dzt[0], s0 ) ;
 
             // upper target: pb below zp[2] (central), above it projected
@@ -774,11 +883,11 @@ RAJA_INLINE void intsc24_hex_split8
             IntscPoly const *pc, *pu ;
             intsc_split_or_pass( *pb, 2, zp[2], sc, su, pc, pu ) ;
             if ( pc != nullptr ) {
-              intsc_add_polygon<false>( *pc, xp[ix], dtx[ix], ax, yp[iy], dty[iy], ay,
+              intsc_add_polygon<false, LEAN>( *pc, xp[ix], dtx[ix], ax, yp[iy], dty[iy], ay,
                                         zp[1], dzt[1], s1 ) ;
             }
             if ( pu != nullptr ) {
-              intsc_add_polygon<true>( *pu, xp[ix], dtx[ix], ax, yp[iy], dty[iy], ay,
+              intsc_add_polygon<true, LEAN>( *pu, xp[ix], dtx[ix], ax, yp[iy], dty[iy], ay,
                                        zp[1], dzt[1], s1 ) ;
             }
           }
@@ -790,7 +899,8 @@ RAJA_INLINE void intsc24_hex_split8
 
 //   One donor zone (records 8*dz .. 8*dz+7, targets in the order of
 //   INTSC_HEXRECT::setupIntscPairs) with the plane-splitting algorithm.
-#define INTSC_HEXRECT_SPLIT_BODY(dz) \
+#define INTSC_HEXRECT_SPLIT_BODY(dz) INTSC_HEXRECT_SPLIT_BODY_T(dz, false)
+#define INTSC_HEXRECT_SPLIT_BODY_T(dz, LEAN) \
   { \
     Index_type const irec0 = 8 * (dz) ; \
     Real_type xd[8], yd[8], zd[8] ; \
@@ -811,7 +921,7 @@ RAJA_INLINE void intsc24_hex_split8
     Int_type const jy = ( tz / nxzones ) % nyzones ; \
     Int_type const jx = tz % nxzones ; \
     Real_type out[8][4] ; \
-    intsc24_hex_split8( xd, yd, zd, plane->planes[2] + jx, plane->planes[1] + jy, \
+    intsc24_hex_split8<LEAN>( xd, yd, zd, plane->planes[2] + jx, plane->planes[1] + jy, \
                         plane->planes[0] + jz, out ) ; \
     Real_ptr record = records + 4 * irec0 ; \
     for ( Index_type r = 0 ; r < 8 ; ++r ) { \

@@ -535,6 +535,175 @@ constexpr RAJA::Index_type DPA_SYM = 6;
     }                                                                          \
   }
 
+#include "FEM_SIMD.hpp"
+
+#if defined(RAJAPERF_FEM_AVX512)
+//
+// AVX-512 batch of FEM_VL elements [e0, e0+nel), stages 1-9 of the CPU SoA
+// variant: X, D and Y move between AoS and SoA through 8x8 in-register
+// transposes of each element's contiguous blocks instead of gathers and
+// scatters. The next batch's D, X and Y are prefetched (DRAM bound).
+//
+RAJAPERF_FEM_NOINLINE void diffusion3dpa_batch_avx512(
+    rajaperf::Real_const_ptr Basis, rajaperf::Real_const_ptr dBasis,
+    rajaperf::Real_const_ptr D, rajaperf::Real_const_ptr X,
+    rajaperf::Real_ptr Y, const rajaperf::Index_type e0,
+    const rajaperf::Index_type nel, const rajaperf::Index_type NE)
+{
+  using namespace rajaperf::fem_simd;
+  using rajaperf::Real_type;
+  using rajaperf::Index_type;
+  constexpr Index_type D1 = diff::D1D;
+  constexpr Index_type Q1 = diff::Q1D;
+  constexpr Index_type ND = D1 * D1 * D1;
+  constexpr Index_type NQ = Q1 * Q1 * Q1;
+  constexpr Index_type NS = diff::DPA_SYM;
+
+  if (e0 + 2 * FEM_VL <= NE) {
+    const char *const pd = reinterpret_cast<const char *>(D + NQ * NS * (e0 + FEM_VL));
+    for (Index_type o = 0; o < NQ * NS * FEM_VL * 8; o += 64) {
+      __builtin_prefetch(pd + o, 0, 3);
+    }
+    const char *const px = reinterpret_cast<const char *>(X + ND * (e0 + FEM_VL));
+    const char *const py = reinterpret_cast<const char *>(Y + ND * (e0 + FEM_VL));
+    for (Index_type o = 0; o < ND * FEM_VL * 8; o += 64) {
+      __builtin_prefetch(px + o, 0, 3);
+      __builtin_prefetch(py + o, 1, 3);
+    }
+  }
+
+  Real_type B[Q1][D1], G[Q1][D1];
+  for (Index_type d = 0; d < D1; ++d) {
+    for (Index_type q = 0; q < Q1; ++q) {
+      B[q][d] = DPA_b(q, d);
+      G[q][d] = DPA_g(q, d);
+    }
+  }
+
+  const Real_type *xrow[8], *drow[8];
+  Real_type *yrow[8];
+  for (Index_type l = 0; l < 8; ++l) {
+    const Index_type e = e0 + ((l < nel) ? l : nel - 1);
+    xrow[l] = X + ND * e;
+    yrow[l] = Y + ND * e;
+    drow[l] = D + NQ * NS * e;
+  }
+
+  alignas(64) vd sX[D1][D1][D1];
+  RAJAPERF_FEM_STACK_ALIGN(sX);
+  load_transpose<ND>(xrow, &sX[0][0][0]);
+
+  vd DDQ0[D1][D1][Q1], DDQ1[D1][D1][Q1];
+  for (Index_type dz = 0; dz < D1; ++dz) {
+    for (Index_type dy = 0; dy < D1; ++dy) {
+      for (Index_type qx = 0; qx < Q1; ++qx) {
+        vd u = vzero(), v = vzero();
+        for (Index_type dx = 0; dx < D1; ++dx) {
+          u = vfma(sX[dz][dy][dx], vset1(B[qx][dx]), u);
+          v = vfma(sX[dz][dy][dx], vset1(G[qx][dx]), v);
+        }
+        DDQ0[dz][dy][qx] = u;
+        DDQ1[dz][dy][qx] = v;
+      }
+    }
+  }
+
+  vd DQQ0[D1][Q1][Q1], DQQ1[D1][Q1][Q1], DQQ2[D1][Q1][Q1];
+  for (Index_type dz = 0; dz < D1; ++dz) {
+    for (Index_type qy = 0; qy < Q1; ++qy) {
+      for (Index_type qx = 0; qx < Q1; ++qx) {
+        vd u = vzero(), v = vzero(), w = vzero();
+        for (Index_type dy = 0; dy < D1; ++dy) {
+          u = vfma(DDQ1[dz][dy][qx], vset1(B[qy][dy]), u);
+          v = vfma(DDQ0[dz][dy][qx], vset1(G[qy][dy]), v);
+          w = vfma(DDQ0[dz][dy][qx], vset1(B[qy][dy]), w);
+        }
+        DQQ0[dz][qy][qx] = u;
+        DQQ1[dz][qy][qx] = v;
+        DQQ2[dz][qy][qx] = w;
+      }
+    }
+  }
+
+  // symmetric D: O11 O12 O13 O22 O23 O33 per quadrature point
+  vd QQQ0[Q1][Q1][Q1], QQQ1[Q1][Q1][Q1], QQQ2[Q1][Q1][Q1];
+  for (Index_type qz = 0; qz < Q1; ++qz) {
+    vd Os[NS][Q1 * Q1];
+    for (Index_type s = 0; s < NS; ++s) {
+      const Real_type *srow[8];
+      for (Index_type l = 0; l < 8; ++l) {
+        srow[l] = drow[l] + NQ * s + Q1 * Q1 * qz;
+      }
+      load_transpose<Q1 * Q1>(srow, Os[s]);
+    }
+    for (Index_type qy = 0; qy < Q1; ++qy) {
+      for (Index_type qx = 0; qx < Q1; ++qx) {
+        vd u = vzero(), v = vzero(), w = vzero();
+        for (Index_type dz = 0; dz < D1; ++dz) {
+          u = vfma(DQQ0[dz][qy][qx], vset1(B[qz][dz]), u);
+          v = vfma(DQQ1[dz][qy][qx], vset1(B[qz][dz]), v);
+          w = vfma(DQQ2[dz][qy][qx], vset1(G[qz][dz]), w);
+        }
+        const Index_type q = qx + Q1 * qy;
+        QQQ0[qz][qy][qx] = vfma(Os[2][q], w, vfma(Os[1][q], v, vmul(Os[0][q], u)));
+        QQQ1[qz][qy][qx] = vfma(Os[4][q], w, vfma(Os[3][q], v, vmul(Os[1][q], u)));
+        QQQ2[qz][qy][qx] = vfma(Os[5][q], w, vfma(Os[4][q], v, vmul(Os[2][q], u)));
+      }
+    }
+  }
+
+  vd QQD0[Q1][Q1][D1], QQD1[Q1][Q1][D1], QQD2[Q1][Q1][D1];
+  for (Index_type qz = 0; qz < Q1; ++qz) {
+    for (Index_type qy = 0; qy < Q1; ++qy) {
+      for (Index_type dx = 0; dx < D1; ++dx) {
+        vd u = vzero(), v = vzero(), w = vzero();
+        for (Index_type qx = 0; qx < Q1; ++qx) {
+          u = vfma(QQQ0[qz][qy][qx], vset1(G[qx][dx]), u);
+          v = vfma(QQQ1[qz][qy][qx], vset1(B[qx][dx]), v);
+          w = vfma(QQQ2[qz][qy][qx], vset1(B[qx][dx]), w);
+        }
+        QQD0[qz][qy][dx] = u;
+        QQD1[qz][qy][dx] = v;
+        QQD2[qz][qy][dx] = w;
+      }
+    }
+  }
+
+  vd QDD0[Q1][D1][D1], QDD1[Q1][D1][D1], QDD2[Q1][D1][D1];
+  for (Index_type qz = 0; qz < Q1; ++qz) {
+    for (Index_type dy = 0; dy < D1; ++dy) {
+      for (Index_type dx = 0; dx < D1; ++dx) {
+        vd u = vzero(), v = vzero(), w = vzero();
+        for (Index_type qy = 0; qy < Q1; ++qy) {
+          u = vfma(QQD0[qz][qy][dx], vset1(B[qy][dy]), u);
+          v = vfma(QQD1[qz][qy][dx], vset1(G[qy][dy]), v);
+          w = vfma(QQD2[qz][qy][dx], vset1(B[qy][dy]), w);
+        }
+        QDD0[qz][dy][dx] = u;
+        QDD1[qz][dy][dx] = v;
+        QDD2[qz][dy][dx] = w;
+      }
+    }
+  }
+
+  alignas(64) vd y[D1][D1][D1];
+  for (Index_type dz = 0; dz < D1; ++dz) {
+    for (Index_type dy = 0; dy < D1; ++dy) {
+      for (Index_type dx = 0; dx < D1; ++dx) {
+        vd u = vzero(), v = vzero(), w = vzero();
+        for (Index_type qz = 0; qz < Q1; ++qz) {
+          u = vfma(QDD0[qz][dy][dx], vset1(B[qz][dz]), u);
+          v = vfma(QDD1[qz][dy][dx], vset1(B[qz][dz]), v);
+          w = vfma(QDD2[qz][dy][dx], vset1(G[qz][dz]), w);
+        }
+        y[dz][dy][dx] = vadd(vadd(u, v), w);
+      }
+    }
+  }
+  transpose_store<ND, true>(yrow, nel, &y[0][0][0]);
+}
+#endif
+
 namespace rajaperf {
 class RunParams;
 
@@ -558,6 +727,7 @@ public:
   void defineSyclVariantTunings();
 
   void runSeqVariant(VariantID vid);
+  template <size_t tune_idx>
   void runOpenMPVariant(VariantID vid);
 
   template <size_t block_size> void runCudaVariantImpl(VariantID vid);

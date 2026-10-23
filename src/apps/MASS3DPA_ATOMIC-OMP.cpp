@@ -21,6 +21,9 @@ namespace rajaperf {
 namespace apps {
 
 
+// tune_idx 0: default; 1, 2, 3: AVX-512 batches with software prefetch of D
+// and ElemToDoF 1, 2, 4 batches ahead
+template <size_t tune_idx>
 void MASS3DPA_ATOMIC::runOpenMPVariant(VariantID vid) {
 
 #if defined(RAJA_ENABLE_OPENMP) && defined(RUN_OPENMP)
@@ -34,6 +37,8 @@ void MASS3DPA_ATOMIC::runOpenMPVariant(VariantID vid) {
   const Index_type Nz = m_Nz;
   const Index_type nby = (Ny + MPAT_ROW_BLOCK - 1) / MPAT_ROW_BLOCK;
   const Index_type nbz = (Nz + MPAT_ROW_BLOCK - 1) / MPAT_ROW_BLOCK;
+  constexpr int PF = tune_idx == 0 ? 0 : (tune_idx == 1 ? 1 : (tune_idx == 2 ? 2 : 4));
+  RAJA_UNUSED_VAR(PF);
 
   switch (vid) {
 
@@ -56,7 +61,7 @@ RP_CALI_SUBKERNEL_BEGIN("MASS3DPA_ATOMIC_1");
       for (Index_type e0 = rend - Nx; e0 < rend; e0 += FEM_VL) {
 
 #if defined(RAJAPERF_FEM_AVX512)
-        mass3dpa_atomic_batch_avx512(B, D, X, Y, ElemToDoF, e0, rend);
+        mass3dpa_atomic_batch_avx512<PF>(B, D, X, Y, ElemToDoF, e0, rend, NE);
 #else
         MASS3DPA_ATOMIC_0_CPU_SIMD(e0, rend);
 
@@ -146,7 +151,7 @@ RP_CALI_SUBKERNEL_END("MASS3DPA_ATOMIC_1");
            for (Index_type e0 = rend - Nx; e0 < rend; e0 += FEM_VL) {
 
 #if defined(RAJAPERF_FEM_AVX512)
-            mass3dpa_atomic_batch_avx512(B, D, X, Y, ElemToDoF, e0, rend);
+            mass3dpa_atomic_batch_avx512<PF>(B, D, X, Y, ElemToDoF, e0, rend, NE);
 #else
             MASS3DPA_ATOMIC_0_CPU_SIMD(e0, rend);
 
@@ -299,7 +304,17 @@ RP_CALI_SUBKERNEL_END("MASS3DPA_ATOMIC_1");
 #endif
 }
 
-RAJAPERF_DEFAULT_TUNING_DEFINE_BOILERPLATE(MASS3DPA_ATOMIC, OpenMP, Base_OpenMP, RAJA_OpenMP)
+void MASS3DPA_ATOMIC::defineOpenMPVariantTunings()
+{
+  for (VariantID vid : {Base_OpenMP, RAJA_OpenMP}) {
+    addVariantTuning<&MASS3DPA_ATOMIC::runOpenMPVariant<0>>(vid, getDefaultTuningName());
+#if defined(RAJAPERF_FEM_AVX512)
+    addVariantTuning<&MASS3DPA_ATOMIC::runOpenMPVariant<1>>(vid, "pf1");
+    addVariantTuning<&MASS3DPA_ATOMIC::runOpenMPVariant<2>>(vid, "pf2");
+    addVariantTuning<&MASS3DPA_ATOMIC::runOpenMPVariant<3>>(vid, "pf4");
+#endif
+  }
+}
 
 } // end namespace apps
 } // end namespace rajaperf

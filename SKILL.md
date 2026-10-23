@@ -66,6 +66,7 @@ Collect these numbers for every kernel before changing code:
 | Measurement | How | Interpretation |
 |---|---|---|
 | Achieved GB/s | bytes moved / time | ≥ ~80% of *measured* socket DRAM bandwidth means memory bound |
+| **Real DRAM traffic** | memory-controller counters (e.g. `perf stat -a -e uncore_imc/cas_count_read/,uncore_imc/cas_count_write/`), 3x-reps minus 1x-reps run, divided by reps | real bytes far above nominal means re-reads (cache blocking helps); near zero means cache resident. Measure the DRAM peak the same way with a STREAM triad that is many times the LLC: a triad only a few times the LLC can overstate it by ~30% |
 | Achieved FLOP/s | FLOPs / time | compare to cores × FLOP/cycle × sustained SIMD clock |
 | **Hardware FLOPs** | PMU counters, e.g. `perf stat -e fp_arith_inst_retired.{scalar,128b_packed,256b_packed,512b_packed}_double` (weights 1, 2, 4, 8; FMA already counts 2) | a nominal/hardware ratio above 1 means the nominal model overstates the real work |
 | Vector share | wide-vector fraction of hardware FLOPs | low share means the code did not vectorize |
@@ -87,6 +88,14 @@ Classes and what to do next:
   - Gather instead of scatter.
   - No atomics.
   - Fewer indirections.
+  - Stencils over 3D grids: if real reads exceed nominal, the neighbouring
+    plane is re-read from DRAM. Tile the in-plane rows and walk the planes
+    innermost so the next plane stays in L2.
+  - Scattered per-item data (sweeps, unstructured meshes): software-prefetch
+    the item a few steps ahead.
+- **Load imbalance:** with T tasks on N threads and T mod N small, the last
+  round leaves most threads idle. Run full rounds with one thread per task
+  and the remainder with teams of threads per task.
 - **Compute bound:**
   - First look for an algorithm with less work (stage 3).
   - Then SIMD layout (stage 2) and intrinsics (stage 4).
@@ -321,11 +330,23 @@ re-read soon afterwards.**
 - Add optimizations as **named variants or tunings** next to an untouched
   reference default. Use compile-time dispatch (`template <size_t idx>` +
   `if constexpr`) so the reference code stays byte-for-byte unchanged.
+  - Turning the reference function into a template can still change its
+    code: lambdas inside it lose internal linkage and with it the inliner's
+    bonus, so a lambda loop may stop vectorizing (seen as a 2x slowdown).
+    Check the vectorization remarks of the default, or keep the reference
+    as a plain member function and put the new tunings in a separate
+    template.
+- Sense-reversing barriers that persist across repetitions must start each
+  repetition from the barrier's current sense, not from 0; otherwise an odd
+  number of waits per repetition lets threads pass or deadlock later.
 - Register ISA-specific variants only when the ISA is available.
 - Put shared SIMD helpers in one header, not copied per kernel.
 - The comparison driver builds the baseline and the optimized tree with
   identical flags, runs them interleaved, and emits a markdown/CSV table.
   Bash arrays are not exported to child processes, so pass lists as strings.
+- Submit long measurements as batch jobs writing to a log file; interactive
+  `ssh ... srun` sessions with long silent stretches can drop and cancel the
+  job. Do not edit a shell script while a job is executing it.
 - Useful commands:
   ```bash
   # hardware FLOPs on one pinned core; subtract a 1x-reps run from a 3x-reps run to remove setup cost

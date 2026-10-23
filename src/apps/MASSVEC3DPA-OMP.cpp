@@ -20,7 +20,8 @@ namespace rajaperf {
 namespace apps {
 
 
-// tune_idx 0: default; 1: AVX-512 batches with streaming stores of Y
+// tune_idx 0: default; 1: AVX-512 batches with streaming stores of Y;
+// 2, 3, 4: as 1 with software prefetch 1, 2, 4 batches ahead
 template <size_t tune_idx>
 void MASSVEC3DPA::runOpenMPVariant(VariantID vid)
 {
@@ -31,7 +32,8 @@ void MASSVEC3DPA::runOpenMPVariant(VariantID vid)
   MASSVEC3DPA_DATA_SETUP;
 
 #if defined(RAJAPERF_FEM_AVX512)
-  if constexpr (tune_idx == 1) {
+  if constexpr (tune_idx >= 1) {
+    constexpr int PF = tune_idx == 1 ? 0 : (tune_idx == 2 ? 1 : (tune_idx == 3 ? 2 : 4));
 
     switch (vid) {
 
@@ -43,8 +45,8 @@ void MASSVEC3DPA::runOpenMPVariant(VariantID vid)
         {
           #pragma omp for nowait
           for (Index_type e0 = 0; e0 < NE; e0 += FEM_VL) {
-            massvec3dpa_batch_avx512<true>(B, D, X, Y, e0,
-                                           (NE - e0 < FEM_VL) ? NE - e0 : FEM_VL);
+            massvec3dpa_batch_avx512<true, PF>(B, D, X, Y, e0,
+                                               (NE - e0 < FEM_VL) ? NE - e0 : FEM_VL, NE);
           }
           fem_simd::stream_fence();
         }
@@ -61,8 +63,8 @@ void MASSVEC3DPA::runOpenMPVariant(VariantID vid)
         RAJA::region<RAJA::omp_parallel_region>( [=]() {
           RAJA::forall< RAJA::omp_for_nowait_static_exec< > >( res,
             RAJA::RangeStrideSegment(0, NE, FEM_VL), [=](Index_type e0) {
-              massvec3dpa_batch_avx512<true>(B, D, X, Y, e0,
-                                             (NE - e0 < FEM_VL) ? NE - e0 : FEM_VL);
+              massvec3dpa_batch_avx512<true, PF>(B, D, X, Y, e0,
+                                                 (NE - e0 < FEM_VL) ? NE - e0 : FEM_VL, NE);
             });
           fem_simd::stream_fence();
         });
@@ -338,6 +340,9 @@ void MASSVEC3DPA::defineOpenMPVariantTunings()
     addVariantTuning<&MASSVEC3DPA::runOpenMPVariant<0>>(vid, getDefaultTuningName());
 #if defined(RAJAPERF_FEM_AVX512)
     addVariantTuning<&MASSVEC3DPA::runOpenMPVariant<1>>(vid, "nt");
+    addVariantTuning<&MASSVEC3DPA::runOpenMPVariant<2>>(vid, "nt_pf1");
+    addVariantTuning<&MASSVEC3DPA::runOpenMPVariant<3>>(vid, "nt_pf2");
+    addVariantTuning<&MASSVEC3DPA::runOpenMPVariant<4>>(vid, "nt_pf4");
 #endif
   }
 }

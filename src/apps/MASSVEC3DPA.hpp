@@ -336,17 +336,31 @@ constexpr RAJA::Index_type DIM = 3;
 // in-register transposes of each element's contiguous D, X and Y blocks
 // instead of gathers/scatters; stages 3-8 via fem_simd::mass_pa_apply.
 //
-template <bool STREAM = false>
+// PF > 0: D and X of the batch PF batches ahead are prefetched (needs NE).
+//
+template <bool STREAM = false, int PF = 0>
 RAJAPERF_FEM_NOINLINE void massvec3dpa_batch_avx512(
     rajaperf::Real_const_ptr B, rajaperf::Real_const_ptr D,
     rajaperf::Real_const_ptr X, rajaperf::Real_ptr Y,
-    const rajaperf::Index_type e0, const rajaperf::Index_type nel)
+    const rajaperf::Index_type e0, const rajaperf::Index_type nel,
+    const rajaperf::Index_type NE = 0)
 {
   using namespace rajaperf::fem_simd;
   using rajaperf::Real_type;
   using rajaperf::Index_type;
   constexpr Index_type D1 = mvpa::D1D;
   constexpr Index_type Q1 = mvpa::Q1D;
+
+  if constexpr (PF > 0) {
+    const Index_type ep = e0 + PF * FEM_VL;
+    if (ep + FEM_VL <= NE) {
+      prefetch_range(&MVPA_D(0, 0, 0, ep), Q1 * Q1 * Q1 * FEM_VL * sizeof(Real_type));
+      prefetch_range(&MVPA_X(0, 0, 0, 0, ep),
+                     mvpa::DIM * D1 * D1 * D1 * FEM_VL * sizeof(Real_type));
+    }
+  } else {
+    RAJA_UNUSED_VAR(NE);
+  }
 
   Real_type b[Q1][D1];
   for (Index_type d = 0; d < D1; ++d) {

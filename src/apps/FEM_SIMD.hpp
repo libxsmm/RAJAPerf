@@ -337,6 +337,15 @@ RAJA_INLINE void stream_copy(Real_type *RAJA_RESTRICT dst,
 #endif
 }
 
+// Software prefetch of every cache line of [p, p + bytes).
+template <bool WRITE = false>
+RAJA_INLINE void prefetch_range(const void *p, Index_type bytes) {
+  const char *const c = static_cast<const char *>(p);
+  for (Index_type o = 0; o < bytes; o += 64) {
+    __builtin_prefetch(c + o, WRITE ? 1 : 0, 3);
+  }
+}
+
 // Orders a thread's non-temporal stores before later synchronization.
 RAJA_INLINE void stream_fence() {
 #if defined(RAJAPERF_FEM_AVX512)

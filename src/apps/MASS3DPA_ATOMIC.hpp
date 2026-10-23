@@ -374,12 +374,16 @@ constexpr RAJA::Index_type MPAT_ROW_BLOCK = 4;
 // with one masked gather-add-scatter per local dof j. For fixed j the dofs
 // of distinct elements are distinct, so no scatter has conflicting lanes;
 // tail lanes (replicated elements) are masked off.
+// PF > 0: D and ElemToDoF of elements PF batches ahead are prefetched; the
+// rows of a row block are contiguous, so this follows the sweep (needs NE).
 //
+template <int PF = 0>
 RAJAPERF_FEM_NOINLINE void mass3dpa_atomic_batch_avx512(
     rajaperf::Real_const_ptr B, rajaperf::Real_const_ptr D,
     rajaperf::Real_const_ptr X, rajaperf::Real_ptr Y,
     const rajaperf::Index_type *ElemToDoF,
-    const rajaperf::Index_type e0, const rajaperf::Index_type eend)
+    const rajaperf::Index_type e0, const rajaperf::Index_type eend,
+    const rajaperf::Index_type NE = 0)
 {
   using namespace rajaperf::fem_simd;
   using rajaperf::Real_type;
@@ -388,6 +392,16 @@ RAJAPERF_FEM_NOINLINE void mass3dpa_atomic_batch_avx512(
   constexpr Index_type Q1 = mpa_at::Q1D;
   constexpr Index_type ND = D1 * D1 * D1;
   static_assert(sizeof(Index_type) == 8, "64-bit dof indices expected");
+
+  if constexpr (PF > 0) {
+    const Index_type ep = e0 + PF * FEM_VL;
+    if (ep + FEM_VL <= NE) {
+      prefetch_range(&MPAT_D(0, 0, 0, ep), Q1 * Q1 * Q1 * FEM_VL * sizeof(Real_type));
+      prefetch_range(ElemToDoF + ND * ep, ND * FEM_VL * sizeof(Index_type));
+    }
+  } else {
+    RAJA_UNUSED_VAR(NE);
+  }
 
   const Index_type nel = (eend - e0 < FEM_VL) ? eend - e0 : FEM_VL;
   const vmask lm = lane_mask(nel);
@@ -460,6 +474,7 @@ public:
   void defineSyclVariantTunings();
 
   void runSeqVariant(VariantID vid);
+  template <size_t tune_idx>
   void runOpenMPVariant(VariantID vid);
 
   template <size_t block_size> void runCudaVariantImpl(VariantID vid);

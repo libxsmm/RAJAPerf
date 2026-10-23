@@ -21,7 +21,8 @@ namespace apps
 {
 
 // tune_idx 0: one intersection per iteration; 1: one donor zone (its eight
-// intersections) per iteration with plane splitting
+// intersections) per iteration with plane splitting; 2: as 1 without polygon
+// staging copies (split_lean)
 template < size_t tune_idx >
 void INTSC_HEXRECT::runOpenMPVariant(VariantID vid)
 {
@@ -41,7 +42,7 @@ void INTSC_HEXRECT::runOpenMPVariant(VariantID vid)
       if constexpr ( tune_idx == 0 ) {
         INTSC_HEXRECT_OMP ( i ) ;
       } else {
-        INTSC_HEXRECT_SPLIT_BODY ( i ) ;
+        INTSC_HEXRECT_SPLIT_BODY_T ( i, tune_idx == 2 ) ;
       }
   } ;
 
@@ -59,7 +60,7 @@ void INTSC_HEXRECT::runOpenMPVariant(VariantID vid)
           if constexpr ( tune_idx == 0 ) {
             INTSC_HEXRECT_OMP( i ) ;
           } else {
-            INTSC_HEXRECT_SPLIT_BODY( i ) ;
+            INTSC_HEXRECT_SPLIT_BODY_T( i, tune_idx == 2 ) ;
           }
         }
         RP_CALI_SUBKERNEL_END("INTSC_HEXRECT_1");
@@ -125,6 +126,7 @@ void INTSC_HEXRECT::defineOpenMPVariantTunings()
     addVariantTuning<&INTSC_HEXRECT::runOpenMPVariant<0>>(vid, getDefaultTuningName());
     // same result; less work than setFLOPsPerRep() counts
     addVariantTuning<&INTSC_HEXRECT::runOpenMPVariant<1>>(vid, "split");
+    addVariantTuning<&INTSC_HEXRECT::runOpenMPVariant<2>>(vid, "split_lean");
   }
 }
 
