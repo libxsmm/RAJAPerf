@@ -22,7 +22,19 @@ namespace apps
 
 // tune_idx 0: one intersection per iteration; 1: one donor zone (its eight
 // intersections) per iteration with plane splitting; 2: as 1 without polygon
-// staging copies (split_lean)
+// staging copies (split_lean); 3: as 2 for 8 donor zones at once in AVX-512
+// lanes, recomputing a facet with 2 lane by lane where the lanes take
+// different paths (split_simd)
+#if defined(RAJAPERF_FEM_AVX512)
+#define INTSC_HEXRECT_SPLIT_DISPATCH(i) \
+  if constexpr ( tune_idx == 3 ) { \
+    INTSC_HEXRECT_SPLIT_SIMD_BODY( i, nzones ) ; \
+  } else { \
+    INTSC_HEXRECT_SPLIT_BODY_T( i, tune_idx == 2 ) ; \
+  }
+#else
+#define INTSC_HEXRECT_SPLIT_DISPATCH(i) INTSC_HEXRECT_SPLIT_BODY_T( i, tune_idx == 2 ) ;
+#endif
 template < size_t tune_idx >
 void INTSC_HEXRECT::runOpenMPVariant(VariantID vid)
 {
@@ -33,8 +45,11 @@ void INTSC_HEXRECT::runOpenMPVariant(VariantID vid)
   //  standard intersections among threads, iend is getActualProblemSize.
   const Index_type run_reps = getRunReps();
   const Index_type ibegin = 0 ;
+  const Index_type nzones = m_nrecords / intsc_per_zone ;
   const Index_type iend = ( tune_idx == 0 ) ? m_nrecords
-                                            : m_nrecords / intsc_per_zone ;
+                        : ( tune_idx == 3 ) ? ( nzones + 7 ) / 8
+                                            : nzones ;
+  RAJA_UNUSED_VAR(nzones);
 
   INTSC_HEXRECT_DATA_SETUP ;
 
@@ -42,7 +57,7 @@ void INTSC_HEXRECT::runOpenMPVariant(VariantID vid)
       if constexpr ( tune_idx == 0 ) {
         INTSC_HEXRECT_OMP ( i ) ;
       } else {
-        INTSC_HEXRECT_SPLIT_BODY_T ( i, tune_idx == 2 ) ;
+        INTSC_HEXRECT_SPLIT_DISPATCH( i )
       }
   } ;
 
@@ -60,7 +75,7 @@ void INTSC_HEXRECT::runOpenMPVariant(VariantID vid)
           if constexpr ( tune_idx == 0 ) {
             INTSC_HEXRECT_OMP( i ) ;
           } else {
-            INTSC_HEXRECT_SPLIT_BODY_T( i, tune_idx == 2 ) ;
+            INTSC_HEXRECT_SPLIT_DISPATCH( i )
           }
         }
         RP_CALI_SUBKERNEL_END("INTSC_HEXRECT_1");
@@ -127,6 +142,9 @@ void INTSC_HEXRECT::defineOpenMPVariantTunings()
     // same result; less work than setFLOPsPerRep() counts
     addVariantTuning<&INTSC_HEXRECT::runOpenMPVariant<1>>(vid, "split");
     addVariantTuning<&INTSC_HEXRECT::runOpenMPVariant<2>>(vid, "split_lean");
+#if defined(RAJAPERF_FEM_AVX512)
+    addVariantTuning<&INTSC_HEXRECT::runOpenMPVariant<3>>(vid, "split_simd");
+#endif
   }
 }
 

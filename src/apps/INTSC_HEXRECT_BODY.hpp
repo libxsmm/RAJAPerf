@@ -10,6 +10,8 @@
 #ifndef RAJAPerf_Apps_INTSC_HEXRECT_BODY_HPP
 #define RAJAPerf_Apps_INTSC_HEXRECT_BODY_HPP
 
+#include "FEM_SIMD.hpp"
+
 namespace rajaperf {
 
 // Helper functions for the INTSC_HEXRECT kernel
@@ -760,6 +762,132 @@ RAJA_INLINE void intsc_add_polygon
   sums[3] += asumz * det ;
 }
 
+//   Faces of the hexahedron (node lists), as in intsc24_hex.
+static constexpr Int_type intsc_vface[6][4] =
+  { {0, 2, 6, 4}, {1, 5, 7, 3}, {0, 4, 5, 1},
+    {2, 3, 7, 6}, {0, 1, 3, 2}, {4, 6, 7, 5} } ;
+
+//   Per-target frame factors of the 2x2x2 target block, as in intsc24_hex.
+struct IntscFrame
+{
+  Real_type dtx[2], dty[2], dzt[2], a11[2][2], a22[2][2] ;
+} ;
+
+RAJA_INLINE void intsc_frame
+    ( Real_const_ptr xp, Real_const_ptr yp, Real_const_ptr zp, IntscFrame& F )
+{
+  for ( Int_type k = 0 ; k < 2 ; ++k ) {
+    F.dtx[k] = xp[k+1] - xp[k] ;
+    F.dty[k] = yp[k+1] - yp[k] ;
+    F.dzt[k] = ( zp[k+1] > zp[k] ) ? ( zp[k+1] - zp[k] ) : 0.0 ;
+  }
+  for ( Int_type ix = 0 ; ix < 2 ; ++ix ) {
+    for ( Int_type iy = 0 ; iy < 2 ; ++iy ) {
+      Real_type const det = F.dtx[ix] * F.dty[iy] ;
+      Real_type const deti = det / ( det*det + 1.0e-80 ) ;
+      F.a11[ix][iy] = F.dty[iy] * deti ;
+      F.a22[ix][iy] = F.dtx[ix] * deti ;
+    }
+  }
+}
+
+//   Contribution of one triangular facet tri to the 2x2x2 targets (see
+//   intsc24_hex_split8), added to out.
+template < bool LEAN >
+RAJA_INLINE void intsc_split8_facet
+      ( IntscPoly& tri,
+        Real_const_ptr xp, Real_const_ptr yp, Real_const_ptr zp,  // [3] planes
+        IntscFrame const& F, Real_type (&out)[8][4] )
+{
+  Real_type const (&dtx)[2] = F.dtx ;
+  Real_type const (&dty)[2] = F.dty ;
+  Real_type const (&dzt)[2] = F.dzt ;
+  Real_type const (&a11)[2][2] = F.a11 ;
+  Real_type const (&a22)[2][2] = F.a22 ;
+  Real_type lo[3], hi[3] ;
+  for ( Int_type d = 0 ; d < 3 ; ++d ) {
+    lo[d] = hi[d] = tri.c[d][0] ;
+    for ( Int_type k = 1 ; k < 3 ; ++k ) {
+      lo[d] = ( tri.c[d][k] < lo[d] ) ? tri.c[d][k] : lo[d] ;
+      hi[d] = ( tri.c[d][k] > hi[d] ) ? tri.c[d][k] : hi[d] ;
+    }
+  }
+  // facet outside the block's xy extent or below it contributes nothing
+  if ( hi[0] < xp[0] || lo[0] >= xp[2] || hi[1] < yp[0] || lo[1] >= yp[2] ||
+       hi[2] < zp[0] ) {
+    return ;
+  }
+  IntscPoly const* cur = &tri ;
+  IntscPoly cbuf[2] ;
+  if constexpr ( LEAN ) {
+    Int_type nb = 0 ;
+    if ( lo[0] < xp[0] )  { intsc_clip_to<true >( *cur, 0, xp[0], cbuf[nb] ) ; cur = &cbuf[nb] ; nb ^= 1 ; }
+    if ( hi[0] >= xp[2] ) { intsc_clip_to<false>( *cur, 0, xp[2], cbuf[nb] ) ; cur = &cbuf[nb] ; nb ^= 1 ; }
+    if ( lo[1] < yp[0] )  { intsc_clip_to<true >( *cur, 1, yp[0], cbuf[nb] ) ; cur = &cbuf[nb] ; nb ^= 1 ; }
+    if ( hi[1] >= yp[2] ) { intsc_clip_to<false>( *cur, 1, yp[2], cbuf[nb] ) ; cur = &cbuf[nb] ; }
+  } else {
+    if ( lo[0] < xp[0] )  { intsc_clip_polygon<true >( tri, 0, xp[0] ) ; }
+    if ( hi[0] >= xp[2] ) { intsc_clip_polygon<false>( tri, 0, xp[2] ) ; }
+    if ( lo[1] < yp[0] )  { intsc_clip_polygon<true >( tri, 1, yp[0] ) ; }
+    if ( hi[1] >= yp[2] ) { intsc_clip_polygon<false>( tri, 1, yp[2] ) ; }
+  }
+
+  IntscPoly sx[2] ;
+  IntscPoly const* px[2] ;
+  intsc_split_or_pass( *cur, 0, xp[1], sx[0], sx[1], px[0], px[1] ) ;
+
+  for ( Int_type ix = 0 ; ix < 2 ; ++ix ) {
+    if ( px[ix] == nullptr ) { continue ; }
+    IntscPoly sy[2] ;
+    IntscPoly const* pxy[2] ;
+    intsc_split_or_pass( *px[ix], 1, yp[1], sy[0], sy[1], pxy[0], pxy[1] ) ;
+
+    for ( Int_type iy = 0 ; iy < 2 ; ++iy ) {
+      if ( pxy[iy] == nullptr ) { continue ; }
+      Real_type const ax = a11[ix][iy], ay = a22[ix][iy] ;
+
+      // split at the shared z plane: pa below, pb above
+      IntscPoly sa, sb ;
+      IntscPoly const *pa, *pb ;
+      intsc_split_or_pass( *pxy[iy], 2, zp[1], sa, sb, pa, pb ) ;
+
+      // lower target: pa above zp[0] (central), pb projected to its top
+      Real_type (&s0)[4] = out[ix + 2*iy] ;
+      if ( pa != nullptr ) {
+        IntscPoly sl, sh ;
+        IntscPoly const *pl, *ph ;
+        if constexpr ( LEAN ) {
+          ph = intsc_clip_or_pass<true>( *pa, 2, zp[0], sh ) ;
+        } else {
+          intsc_split_or_pass( *pa, 2, zp[0], sl, sh, pl, ph ) ;
+        }
+        if ( ph != nullptr ) {
+          intsc_add_polygon<false, LEAN>( *ph, xp[ix], dtx[ix], ax, yp[iy], dty[iy], ay,
+                                    zp[0], dzt[0], s0 ) ;
+        }
+      }
+      if ( pb != nullptr ) {
+        intsc_add_polygon<true, LEAN>( *pb, xp[ix], dtx[ix], ax, yp[iy], dty[iy], ay,
+                                 zp[0], dzt[0], s0 ) ;
+
+        // upper target: pb below zp[2] (central), above it projected
+        Real_type (&s1)[4] = out[ix + 2*iy + 4] ;
+        IntscPoly sc, su ;
+        IntscPoly const *pc, *pu ;
+        intsc_split_or_pass( *pb, 2, zp[2], sc, su, pc, pu ) ;
+        if ( pc != nullptr ) {
+          intsc_add_polygon<false, LEAN>( *pc, xp[ix], dtx[ix], ax, yp[iy], dty[iy], ay,
+                                    zp[1], dzt[1], s1 ) ;
+        }
+        if ( pu != nullptr ) {
+          intsc_add_polygon<true, LEAN>( *pu, xp[ix], dtx[ix], ax, yp[iy], dty[iy], ay,
+                                   zp[1], dzt[1], s1 ) ;
+        }
+      }
+    }
+  }
+}
+
 //   Volume and moments of one donor hexahedron intersected with the 2x2x2
 //   target zones bounded by planes xp[0..2], yp[0..2], zp[0..2].
 //   out[r][0..3] for target r = ix + 2*iy + 4*iz.
@@ -774,29 +902,11 @@ RAJA_INLINE void intsc24_hex_split8
   for ( Int_type r = 0 ; r < 8 ; ++r ) {
     out[r][0] = out[r][1] = out[r][2] = out[r][3] = 0.0 ;
   }
-
-  // per-target frame factors, as in intsc24_hex
-  Real_type dtx[2], dty[2], dzt[2], a11[2][2], a22[2][2] ;
-  for ( Int_type k = 0 ; k < 2 ; ++k ) {
-    dtx[k] = xp[k+1] - xp[k] ;
-    dty[k] = yp[k+1] - yp[k] ;
-    dzt[k] = ( zp[k+1] > zp[k] ) ? ( zp[k+1] - zp[k] ) : 0.0 ;
-  }
-  for ( Int_type ix = 0 ; ix < 2 ; ++ix ) {
-    for ( Int_type iy = 0 ; iy < 2 ; ++iy ) {
-      Real_type const det = dtx[ix] * dty[iy] ;
-      Real_type const deti = det / ( det*det + 1.0e-80 ) ;
-      a11[ix][iy] = dty[iy] * deti ;
-      a22[ix][iy] = dtx[ix] * deti ;
-    }
-  }
-
-  static constexpr Int_type vface[6][4] =
-    { {0, 2, 6, 4}, {1, 5, 7, 3}, {0, 4, 5, 1},
-      {2, 3, 7, 6}, {0, 1, 3, 2}, {4, 6, 7, 5} } ;
+  IntscFrame F ;
+  intsc_frame( xp, yp, zp, F ) ;
 
   for ( Int_type f = 0 ; f < 6 ; ++f ) {
-    Int_type const* v = vface[f] ;
+    Int_type const* v = intsc_vface[f] ;
     Real_type const fx = 0.25 * ( xd[v[0]] + xd[v[1]] + xd[v[2]] + xd[v[3]] ) ;
     Real_type const fy = 0.25 * ( yd[v[0]] + yd[v[1]] + yd[v[2]] + yd[v[3]] ) ;
     Real_type const fz = 0.25 * ( zd[v[0]] + zd[v[1]] + zd[v[2]] + zd[v[3]] ) ;
@@ -810,89 +920,7 @@ RAJA_INLINE void intsc24_hex_split8
       tri.c[0][0] = xd[vv0] ;  tri.c[0][1] = fx ;  tri.c[0][2] = xd[vv2] ;
       tri.c[1][0] = yd[vv0] ;  tri.c[1][1] = fy ;  tri.c[1][2] = yd[vv2] ;
       tri.c[2][0] = zd[vv0] ;  tri.c[2][1] = fz ;  tri.c[2][2] = zd[vv2] ;
-
-      Real_type lo[3], hi[3] ;
-      for ( Int_type d = 0 ; d < 3 ; ++d ) {
-        lo[d] = hi[d] = tri.c[d][0] ;
-        for ( Int_type k = 1 ; k < 3 ; ++k ) {
-          lo[d] = ( tri.c[d][k] < lo[d] ) ? tri.c[d][k] : lo[d] ;
-          hi[d] = ( tri.c[d][k] > hi[d] ) ? tri.c[d][k] : hi[d] ;
-        }
-      }
-      // facet outside the block's xy extent or below it contributes nothing
-      if ( hi[0] < xp[0] || lo[0] >= xp[2] || hi[1] < yp[0] || lo[1] >= yp[2] ||
-           hi[2] < zp[0] ) {
-        continue ;
-      }
-      IntscPoly const* cur = &tri ;
-      IntscPoly cbuf[2] ;
-      if constexpr ( LEAN ) {
-        Int_type nb = 0 ;
-        if ( lo[0] < xp[0] )  { intsc_clip_to<true >( *cur, 0, xp[0], cbuf[nb] ) ; cur = &cbuf[nb] ; nb ^= 1 ; }
-        if ( hi[0] >= xp[2] ) { intsc_clip_to<false>( *cur, 0, xp[2], cbuf[nb] ) ; cur = &cbuf[nb] ; nb ^= 1 ; }
-        if ( lo[1] < yp[0] )  { intsc_clip_to<true >( *cur, 1, yp[0], cbuf[nb] ) ; cur = &cbuf[nb] ; nb ^= 1 ; }
-        if ( hi[1] >= yp[2] ) { intsc_clip_to<false>( *cur, 1, yp[2], cbuf[nb] ) ; cur = &cbuf[nb] ; }
-      } else {
-        if ( lo[0] < xp[0] )  { intsc_clip_polygon<true >( tri, 0, xp[0] ) ; }
-        if ( hi[0] >= xp[2] ) { intsc_clip_polygon<false>( tri, 0, xp[2] ) ; }
-        if ( lo[1] < yp[0] )  { intsc_clip_polygon<true >( tri, 1, yp[0] ) ; }
-        if ( hi[1] >= yp[2] ) { intsc_clip_polygon<false>( tri, 1, yp[2] ) ; }
-      }
-
-      IntscPoly sx[2] ;
-      IntscPoly const* px[2] ;
-      intsc_split_or_pass( *cur, 0, xp[1], sx[0], sx[1], px[0], px[1] ) ;
-
-      for ( Int_type ix = 0 ; ix < 2 ; ++ix ) {
-        if ( px[ix] == nullptr ) { continue ; }
-        IntscPoly sy[2] ;
-        IntscPoly const* pxy[2] ;
-        intsc_split_or_pass( *px[ix], 1, yp[1], sy[0], sy[1], pxy[0], pxy[1] ) ;
-
-        for ( Int_type iy = 0 ; iy < 2 ; ++iy ) {
-          if ( pxy[iy] == nullptr ) { continue ; }
-          Real_type const ax = a11[ix][iy], ay = a22[ix][iy] ;
-
-          // split at the shared z plane: pa below, pb above
-          IntscPoly sa, sb ;
-          IntscPoly const *pa, *pb ;
-          intsc_split_or_pass( *pxy[iy], 2, zp[1], sa, sb, pa, pb ) ;
-
-          // lower target: pa above zp[0] (central), pb projected to its top
-          Real_type (&s0)[4] = out[ix + 2*iy] ;
-          if ( pa != nullptr ) {
-            IntscPoly sl, sh ;
-            IntscPoly const *pl, *ph ;
-            if constexpr ( LEAN ) {
-              ph = intsc_clip_or_pass<true>( *pa, 2, zp[0], sh ) ;
-            } else {
-              intsc_split_or_pass( *pa, 2, zp[0], sl, sh, pl, ph ) ;
-            }
-            if ( ph != nullptr ) {
-              intsc_add_polygon<false, LEAN>( *ph, xp[ix], dtx[ix], ax, yp[iy], dty[iy], ay,
-                                        zp[0], dzt[0], s0 ) ;
-            }
-          }
-          if ( pb != nullptr ) {
-            intsc_add_polygon<true, LEAN>( *pb, xp[ix], dtx[ix], ax, yp[iy], dty[iy], ay,
-                                     zp[0], dzt[0], s0 ) ;
-
-            // upper target: pb below zp[2] (central), above it projected
-            Real_type (&s1)[4] = out[ix + 2*iy + 4] ;
-            IntscPoly sc, su ;
-            IntscPoly const *pc, *pu ;
-            intsc_split_or_pass( *pb, 2, zp[2], sc, su, pc, pu ) ;
-            if ( pc != nullptr ) {
-              intsc_add_polygon<false, LEAN>( *pc, xp[ix], dtx[ix], ax, yp[iy], dty[iy], ay,
-                                        zp[1], dzt[1], s1 ) ;
-            }
-            if ( pu != nullptr ) {
-              intsc_add_polygon<true, LEAN>( *pu, xp[ix], dtx[ix], ax, yp[iy], dty[iy], ay,
-                                       zp[1], dzt[1], s1 ) ;
-            }
-          }
-        }
-      }
+      intsc_split8_facet<LEAN>( tri, xp, yp, zp, F, out ) ;
     }
   }
 }
@@ -930,6 +958,447 @@ RAJA_INLINE void intsc24_hex_split8
       } \
     } \
   }
+
+#if defined(RAJAPERF_FEM_AVX512)
+//  ---------------------------------------------------------------------------
+//  SIMD plane splitting: intsc24_hex_split8<true> for 8 donor zones at once,
+//  one zone per AVX-512 lane.  Polygons share one vertex count across lanes,
+//  so every decision (which side of a plane each vertex lies on, bounding box
+//  tests) must agree in all lanes; the functions return false as soon as one
+//  does not, and that facet is recomputed with the scalar code lane by lane.
+//  Neighboring donor zones of a regular mesh mostly agree.
+//  ---------------------------------------------------------------------------
+namespace intsc_simd {
+
+using fem_simd::vd ;
+using fem_simd::vmask ;
+
+struct VPoly
+{
+  static constexpr Int_type cap = 12 ;   // triangle clipped by <= 8 planes
+  vd c[3][cap] ;
+  Int_type n = 0 ;
+} ;
+
+RAJA_INLINE vmask vlt( vd a, vd b ) { return _mm512_cmp_pd_mask( a, b, _CMP_LT_OQ ) ; }
+
+//   1 if m holds for all lanes, 0 for none, -1 if mixed.
+RAJA_INLINE int uniform( vmask m ) { return m == 0xff ? 1 : ( m == 0 ? 0 : -1 ) ; }
+
+//   For each vertex k: below[k] = c[axis][k] < cut in all lanes (true) or in
+//   none (false).  Returns false if mixed.
+RAJA_INLINE bool classify( VPoly const& p, Int_type const axis, vd const cut,
+                           bool (&below)[VPoly::cap] )
+{
+  for ( Int_type k = 0 ; k < p.n ; ++k ) {
+    int const u = uniform( vlt( p.c[axis][k], cut ) ) ;
+    if ( u < 0 ) { return false ; }
+    below[k] = u ;
+  }
+  return true ;
+}
+
+RAJA_INLINE void cross( VPoly const& p, Int_type const axis, vd const cut,
+                        Int_type const k, Int_type const j, vd (&v)[3] )
+{
+  vd const a = p.c[axis][k] ;
+  vd const eta = fem_simd::vdiv( fem_simd::vsub( cut, a ),
+                                 fem_simd::vsub( p.c[axis][j], a ) ) ;
+  for ( Int_type d = 0 ; d < 3 ; ++d ) {
+    v[d] = ( d == axis ) ? cut
+         : fem_simd::vfma( fem_simd::vsub( p.c[d][j], p.c[d][k] ), eta, p.c[d][k] ) ;
+  }
+}
+
+//   intsc_split_or_pass for uniform vertex sides.
+RAJA_INLINE bool split_or_pass( VPoly const& p, Int_type const axis, vd const cut,
+                                VPoly& slo, VPoly& shi,
+                                VPoly const*& lo, VPoly const*& hi )
+{
+  lo = hi = nullptr ;
+  if ( p.n < 3 ) { return true ; }
+  bool below[VPoly::cap] ;
+  if ( !classify( p, axis, cut, below ) ) { return false ; }
+  bool all_lo = true, all_hi = true ;
+  for ( Int_type k = 0 ; k < p.n ; ++k ) { all_lo &= below[k] ; all_hi &= !below[k] ; }
+  if ( all_lo ) { lo = &p ; return true ; }
+  if ( all_hi ) { hi = &p ; return true ; }
+  slo.n = shi.n = 0 ;
+  for ( Int_type k = 0 ; k < p.n ; ++k ) {
+    Int_type const j = ( k + 1 == p.n ) ? 0 : k + 1 ;
+    VPoly& side = below[k] ? slo : shi ;
+    for ( Int_type d = 0 ; d < 3 ; ++d ) { side.c[d][side.n] = p.c[d][k] ; }
+    ++side.n ;
+    if ( below[k] != below[j] ) {
+      vd v[3] ;
+      cross( p, axis, cut, k, j, v ) ;
+      for ( Int_type d = 0 ; d < 3 ; ++d ) { slo.c[d][slo.n] = v[d] ;  shi.c[d][shi.n] = v[d] ; }
+      ++slo.n ;  ++shi.n ;
+    }
+  }
+  lo = ( slo.n >= 3 ) ? &slo : nullptr ;
+  hi = ( shi.n >= 3 ) ? &shi : nullptr ;
+  return true ;
+}
+
+//   intsc_clip_to (no pass-through) for uniform vertex sides.
+template < bool KEEP_HI >
+RAJA_INLINE bool clip_to( VPoly const& p, Int_type const axis, vd const cut, VPoly& out )
+{
+  bool below[VPoly::cap] ;
+  if ( !classify( p, axis, cut, below ) ) { return false ; }
+  Int_type n = 0 ;
+  for ( Int_type k = 0 ; k < p.n ; ++k ) {
+    Int_type const j = ( k + 1 == p.n ) ? 0 : k + 1 ;
+    if ( below[k] != KEEP_HI ) {
+      for ( Int_type d = 0 ; d < 3 ; ++d ) { out.c[d][n] = p.c[d][k] ; }
+      ++n ;
+    }
+    if ( below[k] != below[j] ) {
+      vd v[3] ;
+      cross( p, axis, cut, k, j, v ) ;
+      for ( Int_type d = 0 ; d < 3 ; ++d ) { out.c[d][n] = v[d] ; }
+      ++n ;
+    }
+  }
+  out.n = n ;
+  return true ;
+}
+
+//   intsc_clip_or_pass<true> (keep c[axis] >= cut) for uniform vertex sides.
+RAJA_INLINE bool clip_hi_or_pass( VPoly const& p, Int_type const axis, vd const cut,
+                                  VPoly& out, VPoly const*& res )
+{
+  res = nullptr ;
+  if ( p.n < 3 ) { return true ; }
+  bool below[VPoly::cap] ;
+  if ( !classify( p, axis, cut, below ) ) { return false ; }
+  bool all_lo = true, all_hi = true ;
+  for ( Int_type k = 0 ; k < p.n ; ++k ) { all_lo &= below[k] ; all_hi &= !below[k] ; }
+  if ( all_lo ) { return true ; }
+  if ( all_hi ) { res = &p ; return true ; }
+  if ( !clip_to<true>( p, axis, cut, out ) ) { return false ; }
+  res = ( out.n >= 3 ) ? &out : nullptr ;
+  return true ;
+}
+
+//   intsc_add_polygon<PROJECT, true> per lane.
+template < bool PROJECT >
+RAJA_INLINE void add_polygon( VPoly const& p,
+                              vd const xt0, vd const dtx, vd const a11,
+                              vd const yt0, vd const dty, vd const a22,
+                              vd const zt0, vd const dzt, vd (&sums)[4] )
+{
+  using namespace fem_simd ;
+  if ( p.n < 3 ) { return ; }
+  vd const one3 = vset1( 0.33333333333333333 ), half = vset1( 0.5 ) ;
+  auto tx = [&] ( Int_type k ) { return vmul( vsub( p.c[0][k], xt0 ), a11 ) ; } ;
+  auto ty = [&] ( Int_type k ) { return vmul( vsub( p.c[1][k], yt0 ), a22 ) ; } ;
+  auto tz = [&] ( Int_type k ) { return PROJECT ? dzt : vsub( p.c[2][k], zt0 ) ; } ;
+  vd const hdx = vmul( half, dtx ), hdy = vmul( half, dty ) ;
+  vd asum0 = vzero(), asumx = vzero(), asumy = vzero(), asumz = vzero() ;
+  vd const xc0 = tx(0), yc0 = ty(0), zc0 = tz(0) ;
+  vd xc1 = tx(1), yc1 = ty(1), zc1 = tz(1) ;
+  for ( Int_type kk = 2 ; kk < p.n ; kk++ ) {
+    vd const xc2 = tx(kk), yc2 = ty(kk), zc2 = tz(kk) ;
+    vd s0tri, sxtri, sytri, sztri, m ;
+    m = vmul( half, vadd( zc0, zc1 ) ) ;
+    s0tri = m ;
+    sxtri = vmul( m, vfma( hdx, vadd( xc0, xc1 ), xt0 ) ) ;
+    sytri = vmul( m, vfma( hdy, vadd( yc0, yc1 ), yt0 ) ) ;
+    sztri = vmul( m, vfma( half, m, zt0 ) ) ;
+    m = vmul( half, vadd( zc1, zc2 ) ) ;
+    s0tri = vadd( s0tri, m ) ;
+    sxtri = vfma( m, vfma( hdx, vadd( xc1, xc2 ), xt0 ), sxtri ) ;
+    sytri = vfma( m, vfma( hdy, vadd( yc1, yc2 ), yt0 ), sytri ) ;
+    sztri = vfma( m, vfma( half, m, zt0 ), sztri ) ;
+    m = vmul( half, vadd( zc2, zc0 ) ) ;
+    s0tri = vadd( s0tri, m ) ;
+    sxtri = vfma( m, vfma( hdx, vadd( xc2, xc0 ), xt0 ), sxtri ) ;
+    sytri = vfma( m, vfma( hdy, vadd( yc2, yc0 ), yt0 ), sytri ) ;
+    sztri = vfma( m, vfma( half, m, zt0 ), sztri ) ;
+    vd area = vmul( vsub( xc0, xc1 ), vadd( yc0, yc1 ) ) ;
+    area = vfma( vsub( xc1, xc2 ), vadd( yc1, yc2 ), area ) ;
+    area = vfma( vsub( xc2, xc0 ), vadd( yc2, yc0 ), area ) ;
+    vd const w = vmul( vmul( half, one3 ), area ) ;
+    asum0 = vfma( w, s0tri, asum0 ) ;
+    asumx = vfma( w, sxtri, asumx ) ;
+    asumy = vfma( w, sytri, asumy ) ;
+    asumz = vfma( w, sztri, asumz ) ;
+    xc1 = xc2 ;  yc1 = yc2 ;  zc1 = zc2 ;
+  }
+  vd const det = vmul( dtx, dty ) ;
+  sums[0] = vfma( asum0, det, sums[0] ) ;
+  sums[1] = vfma( asumx, det, sums[1] ) ;
+  sums[2] = vfma( asumy, det, sums[2] ) ;
+  sums[3] = vfma( asumz, det, sums[3] ) ;
+}
+
+//   Frame factors of the 2x2x2 target block per lane, as intsc_frame.
+struct VFrame
+{
+  vd dtx[2], dty[2], dzt[2], a11[2][2], a22[2][2] ;
+} ;
+
+//   Contribution of one facet (intsc_split8_facet<true> per lane) to the
+//   facet-local sums acc[r] of the targets r in 'touched'.  Returns false,
+//   with acc only partially updated, if the lanes take different paths.
+RAJA_INLINE bool vfacet( VPoly const& tri,
+                         vd const (&xp)[3], vd const (&yp)[3], vd const (&zp)[3],
+                         VFrame const& F, vd (&acc)[8][4], unsigned& touched )
+{
+  using namespace fem_simd ;
+  auto target = [&] ( Int_type r ) -> vd (&)[4] {
+    if ( !( ( touched >> r ) & 1u ) ) {
+      acc[r][0] = acc[r][1] = acc[r][2] = acc[r][3] = vzero() ;
+      touched |= 1u << r ;
+    }
+    return acc[r] ;
+  } ;
+
+  vd lo[3], hi[3] ;
+  for ( Int_type d = 0 ; d < 3 ; ++d ) {
+    lo[d] = _mm512_min_pd( _mm512_min_pd( tri.c[d][0], tri.c[d][1] ), tri.c[d][2] ) ;
+    hi[d] = _mm512_max_pd( _mm512_max_pd( tri.c[d][0], tri.c[d][1] ), tri.c[d][2] ) ;
+  }
+  vmask const skip = vlt( hi[0], xp[0] ) | ( vmask )~vlt( lo[0], xp[2] ) |
+                     vlt( hi[1], yp[0] ) | ( vmask )~vlt( lo[1], yp[2] ) |
+                     vlt( hi[2], zp[0] ) ;
+  int const us = uniform( skip ) ;
+  if ( us < 0 ) { return false ; }
+  if ( us == 1 ) { return true ; }
+
+  VPoly const* cur = &tri ;
+  VPoly cbuf[2] ;
+  Int_type nb = 0 ;
+  int u ;
+  if ( ( u = uniform( vlt( lo[0], xp[0] ) ) ) != 0 ) {
+    if ( u < 0 || !clip_to<true>( *cur, 0, xp[0], cbuf[nb] ) ) { return false ; }
+    cur = &cbuf[nb] ;  nb ^= 1 ;
+  }
+  if ( ( u = uniform( ( vmask )~vlt( hi[0], xp[2] ) ) ) != 0 ) {
+    if ( u < 0 || !clip_to<false>( *cur, 0, xp[2], cbuf[nb] ) ) { return false ; }
+    cur = &cbuf[nb] ;  nb ^= 1 ;
+  }
+  if ( ( u = uniform( vlt( lo[1], yp[0] ) ) ) != 0 ) {
+    if ( u < 0 || !clip_to<true>( *cur, 1, yp[0], cbuf[nb] ) ) { return false ; }
+    cur = &cbuf[nb] ;  nb ^= 1 ;
+  }
+  if ( ( u = uniform( ( vmask )~vlt( hi[1], yp[2] ) ) ) != 0 ) {
+    if ( u < 0 || !clip_to<false>( *cur, 1, yp[2], cbuf[nb] ) ) { return false ; }
+    cur = &cbuf[nb] ;
+  }
+
+  VPoly sx[2] ;
+  VPoly const* px[2] ;
+  if ( !split_or_pass( *cur, 0, xp[1], sx[0], sx[1], px[0], px[1] ) ) { return false ; }
+
+  for ( Int_type ix = 0 ; ix < 2 ; ++ix ) {
+    if ( px[ix] == nullptr ) { continue ; }
+    VPoly sy[2] ;
+    VPoly const* pxy[2] ;
+    if ( !split_or_pass( *px[ix], 1, yp[1], sy[0], sy[1], pxy[0], pxy[1] ) ) { return false ; }
+
+    for ( Int_type iy = 0 ; iy < 2 ; ++iy ) {
+      if ( pxy[iy] == nullptr ) { continue ; }
+      vd const ax = F.a11[ix][iy], ay = F.a22[ix][iy] ;
+      VPoly sa, sb ;
+      VPoly const *pa, *pb ;
+      if ( !split_or_pass( *pxy[iy], 2, zp[1], sa, sb, pa, pb ) ) { return false ; }
+
+      if ( pa != nullptr ) {
+        VPoly sh ;
+        VPoly const* ph ;
+        if ( !clip_hi_or_pass( *pa, 2, zp[0], sh, ph ) ) { return false ; }
+        if ( ph != nullptr ) {
+          add_polygon<false>( *ph, xp[ix], F.dtx[ix], ax, yp[iy], F.dty[iy], ay,
+                              zp[0], F.dzt[0], target( ix + 2*iy ) ) ;
+        }
+      }
+      if ( pb != nullptr ) {
+        add_polygon<true>( *pb, xp[ix], F.dtx[ix], ax, yp[iy], F.dty[iy], ay,
+                           zp[0], F.dzt[0], target( ix + 2*iy ) ) ;
+        VPoly sc, su ;
+        VPoly const *pc, *pu ;
+        if ( !split_or_pass( *pb, 2, zp[2], sc, su, pc, pu ) ) { return false ; }
+        if ( pc != nullptr ) {
+          add_polygon<false>( *pc, xp[ix], F.dtx[ix], ax, yp[iy], F.dty[iy], ay,
+                              zp[1], F.dzt[1], target( ix + 2*iy + 4 ) ) ;
+        }
+        if ( pu != nullptr ) {
+          add_polygon<true>( *pu, xp[ix], F.dtx[ix], ax, yp[iy], F.dty[iy], ay,
+                             zp[1], F.dzt[1], target( ix + 2*iy + 4 ) ) ;
+        }
+      }
+    }
+  }
+  return true ;
+}
+
+//   intsc24_hex_split8<true> for 8 donor zones; out[4*r + v] for target r.
+//   ld[l], lxp[l] are lane l's node coordinates (x[8], y[8], z[8]) and
+//   planes (x[3], y[3], z[3]).  A facet whose lanes take different paths is
+//   recomputed with intsc_split8_facet<true> lane by lane.
+RAJA_INLINE void hex_split8( Real_type const (&ld)[8][24], Real_type const (&lp)[8][9],
+                             vd (&out)[32] )
+{
+  using namespace fem_simd ;
+  vd c[24], pl[9] ;
+  {
+    Real_type const* rows[8] ;
+    for ( Int_type l = 0 ; l < 8 ; ++l ) { rows[l] = ld[l] ; }
+    load_transpose<24>( rows, c ) ;
+    for ( Int_type l = 0 ; l < 8 ; ++l ) { rows[l] = lp[l] ; }
+    load_transpose<9>( rows, pl ) ;
+  }
+  vd const* xd = c ;
+  vd const* yd = c + 8 ;
+  vd const* zd = c + 16 ;
+  vd const (&xp)[3] = reinterpret_cast<vd const (&)[3]>( pl[0] ) ;
+  vd const (&yp)[3] = reinterpret_cast<vd const (&)[3]>( pl[3] ) ;
+  vd const (&zp)[3] = reinterpret_cast<vd const (&)[3]>( pl[6] ) ;
+
+  for ( Int_type r = 0 ; r < 32 ; ++r ) { out[r] = vzero() ; }
+
+  VFrame F ;
+  for ( Int_type k = 0 ; k < 2 ; ++k ) {
+    F.dtx[k] = vsub( xp[k+1], xp[k] ) ;
+    F.dty[k] = vsub( yp[k+1], yp[k] ) ;
+    F.dzt[k] = _mm512_max_pd( vsub( zp[k+1], zp[k] ), vzero() ) ;
+  }
+  for ( Int_type ix = 0 ; ix < 2 ; ++ix ) {
+    for ( Int_type iy = 0 ; iy < 2 ; ++iy ) {
+      vd const det = vmul( F.dtx[ix], F.dty[iy] ) ;
+      vd const deti = vdiv( det, vfma( det, det, vset1( 1.0e-80 ) ) ) ;
+      F.a11[ix][iy] = vmul( F.dty[iy], deti ) ;
+      F.a22[ix][iy] = vmul( F.dtx[ix], deti ) ;
+    }
+  }
+
+  bool scalar_used = false ;
+  IntscFrame sf[8] ;
+  Real_type so[8][8][4] ;
+  vd const quarter = vset1( 0.25 ) ;
+
+  for ( Int_type f = 0 ; f < 6 ; ++f ) {
+    Int_type const* v = intsc_vface[f] ;
+    vd const fx = vmul( quarter, vadd( vadd( xd[v[0]], xd[v[1]] ), vadd( xd[v[2]], xd[v[3]] ) ) ) ;
+    vd const fy = vmul( quarter, vadd( vadd( yd[v[0]], yd[v[1]] ), vadd( yd[v[2]], yd[v[3]] ) ) ) ;
+    vd const fz = vmul( quarter, vadd( vadd( zd[v[0]], zd[v[1]] ), vadd( zd[v[2]], zd[v[3]] ) ) ) ;
+
+    for ( Int_type k0 = 0 ; k0 < 4 ; ++k0 ) {
+      Int_type const vv0 = v[k0], vv2 = v[(k0 + 1) & 3] ;
+      VPoly tri ;
+      tri.n = 3 ;
+      tri.c[0][0] = xd[vv0] ;  tri.c[0][1] = fx ;  tri.c[0][2] = xd[vv2] ;
+      tri.c[1][0] = yd[vv0] ;  tri.c[1][1] = fy ;  tri.c[1][2] = yd[vv2] ;
+      tri.c[2][0] = zd[vv0] ;  tri.c[2][1] = fz ;  tri.c[2][2] = zd[vv2] ;
+
+      vd acc[8][4] ;
+      unsigned touched = 0 ;
+      if ( vfacet( tri, xp, yp, zp, F, acc, touched ) ) {
+        for ( Int_type r = 0 ; r < 8 ; ++r ) {
+          if ( ( touched >> r ) & 1u ) {
+            for ( Int_type q = 0 ; q < 4 ; ++q ) {
+              out[4*r + q] = vadd( out[4*r + q], acc[r][q] ) ;
+            }
+          }
+        }
+        continue ;
+      }
+
+      if ( !scalar_used ) {
+        scalar_used = true ;
+        for ( Int_type l = 0 ; l < 8 ; ++l ) {
+          intsc_frame( lp[l], lp[l] + 3, lp[l] + 6, sf[l] ) ;
+          for ( Int_type r = 0 ; r < 8 ; ++r ) {
+            so[l][r][0] = so[l][r][1] = so[l][r][2] = so[l][r][3] = 0.0 ;
+          }
+        }
+      }
+      for ( Int_type l = 0 ; l < 8 ; ++l ) {
+        Real_type const* lx = ld[l] ;
+        Real_type const* ly = ld[l] + 8 ;
+        Real_type const* lz = ld[l] + 16 ;
+        IntscPoly stri ;
+        stri.n = 3 ;
+        stri.c[0][0] = lx[vv0] ;  stri.c[0][2] = lx[vv2] ;
+        stri.c[1][0] = ly[vv0] ;  stri.c[1][2] = ly[vv2] ;
+        stri.c[2][0] = lz[vv0] ;  stri.c[2][2] = lz[vv2] ;
+        stri.c[0][1] = 0.25 * ( lx[v[0]] + lx[v[1]] + lx[v[2]] + lx[v[3]] ) ;
+        stri.c[1][1] = 0.25 * ( ly[v[0]] + ly[v[1]] + ly[v[2]] + ly[v[3]] ) ;
+        stri.c[2][1] = 0.25 * ( lz[v[0]] + lz[v[1]] + lz[v[2]] + lz[v[3]] ) ;
+        intsc_split8_facet<true>( stri, lp[l], lp[l] + 3, lp[l] + 6, sf[l], so[l] ) ;
+      }
+    }
+  }
+
+  if ( scalar_used ) {
+    alignas(64) Real_type t[8] ;
+    for ( Int_type r = 0 ; r < 8 ; ++r ) {
+      for ( Int_type q = 0 ; q < 4 ; ++q ) {
+        for ( Int_type l = 0 ; l < 8 ; ++l ) { t[l] = so[l][r][q] ; }
+        out[4*r + q] = vadd( out[4*r + q], _mm512_load_pd( t ) ) ;
+      }
+    }
+  }
+}
+
+//   Donor zones [dz0, dz0 + nel), nel <= 8: gather the zones and their target
+//   planes into lanes (tail lanes replicate the last zone), run hex_split8 and
+//   write the records.
+RAJAPERF_FEM_NOINLINE void split8_batch(
+    Real_const_ptr xdnode, Real_const_ptr ydnode, Real_const_ptr zdnode,
+    Int_type const* znlist, Int_type const* intsc_d, Int_type const* intsc_t,
+    Real_const_ptr xplane, Real_const_ptr yplane, Real_const_ptr zplane,
+    Int_type const nxzones, Int_type const nyzones,
+    Real_ptr records, Index_type const dz0, Index_type const nel )
+{
+  alignas(64) Real_type ld[8][24], lp[8][9] ;
+  for ( Index_type l = 0 ; l < 8 ; ++l ) {
+    Index_type const irec0 = 8 * ( dz0 + ( ( l < nel ) ? l : nel - 1 ) ) ;
+    Int_type const dzone = intsc_d[irec0] ;
+    for ( Index_type j = 0 ; j < 8 ; ++j ) {
+      Int_type const node = znlist[ 8*dzone + j ] ;
+      ld[l][j]      = xdnode[node] ;
+      ld[l][j + 8]  = ydnode[node] ;
+      ld[l][j + 16] = zdnode[node] ;
+    }
+    Int_type const tz = intsc_t[irec0] ;
+    Int_type const jz = tz / ( nxzones * nyzones ) ;
+    Int_type const jy = ( tz / nxzones ) % nyzones ;
+    Int_type const jx = tz % nxzones ;
+    for ( Index_type k = 0 ; k < 3 ; ++k ) {
+      lp[l][k]     = xplane[jx + k] ;
+      lp[l][k + 3] = yplane[jy + k] ;
+      lp[l][k + 6] = zplane[jz + k] ;
+    }
+  }
+
+  alignas(64) vd out[32] ;
+  RAJAPERF_FEM_STACK_ALIGN( out ) ;
+  hex_split8( ld, lp, out ) ;
+
+  Real_type* rows[8] ;
+  for ( Index_type l = 0 ; l < 8 ; ++l ) {
+    rows[l] = records + 32 * ( dz0 + ( ( l < nel ) ? l : nel - 1 ) ) ;
+  }
+  fem_simd::transpose_store<32>( rows, nel, out ) ;
+}
+
+}  // end namespace intsc_simd
+
+//   Donor zones [8*b, 8*b + 8) of nzones in SIMD lanes.
+#define INTSC_HEXRECT_SPLIT_SIMD_BODY(b, nzones) \
+  { \
+    Index_type const dz0 = 8 * (b) ; \
+    Index_type const nel = ( (nzones) - dz0 < 8 ) ? (nzones) - dz0 : 8 ; \
+    auto plane = reinterpret_cast<typename INTSC_HEXRECT::Plane*>(ncord_gpu) ; \
+    intsc_simd::split8_batch( xdnode, ydnode, zdnode, znlist, intsc_d, intsc_t, \
+                              plane->planes[2], plane->planes[1], plane->planes[0], \
+                              plane->ncord[2], plane->ncord[1], records, dz0, nel ) ; \
+  }
+#endif
 
 }  // end namespace rajaperf
 

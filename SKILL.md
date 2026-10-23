@@ -129,6 +129,17 @@ index, and has no cross-lane dependencies or serialization.
 3. **Batch many small independent solves** (small LU, Newton or quadratic
    solves) across lanes. Each lane solves a different system with identical
    control flow.
+   - **Branchy geometry (clipping, intersections) on regular meshes:**
+     neighbouring items usually take the same branches (check: near-zero
+     branch misses in the scalar code). Batch them across lanes with one
+     shared control path: turn every branch condition into a lane mask and
+     take the branch only if the mask is all-true or all-false. On a mixed
+     mask, abandon the smallest unit of work (one facet, not the whole
+     item), recompute it with the scalar code lane by lane, and add the
+     results. Accumulate each unit into local sums that are merged only
+     when the unit succeeds, so a partial SIMD result is never counted
+     twice. Measure the fallback rate; coarse fallback (whole batch) can
+     waste much of the gain.
 4. **Compiler pitfalls to check for (seen with clang):**
    - Short lane loops (trip count = VL) get fully unrolled *before* the loop
      vectorizer runs, which leads to poor SLP code. Put
@@ -284,6 +295,13 @@ batch. Each instruction then has NV independent copies in flight.
   between kernels as an inlined helper templated on NV.
 - Register as separate tunings (`_x2`, `_x4`) and measure; the best NV
   depends on the kernel and machine.
+- Check the top-down breakdown first (e.g. `perf stat -M
+  tma_memory_bound,tma_core_bound,tma_l1_bound,tma_divider`). When
+  consecutive items are already independent, out-of-order execution overlaps
+  them and NV > 1 only adds spills. If the kernel is L1-bound on chains of
+  dependent index loads (`a[b[c[i]]]` feeding a gather), neither
+  interleaving nor replacing the gather helps; only shortening the index
+  chain does.
 
 ### 4e. Streaming (non-temporal) stores
 Use them only when the output is **write-only, written in full cache lines,
