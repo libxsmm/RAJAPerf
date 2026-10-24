@@ -87,6 +87,8 @@
 #define RAJAPerf_Apps_FEMSWEEP_HPP
 
 #include <atomic>
+#include <cstdint>
+#include <vector>
 
 #include "common/KernelBase.hpp"
 
@@ -552,6 +554,54 @@ inline void femsweep_team_shape(Index_type ntasks, int nthreads,
     } \
   }
 
+// Angle-independent data of local face 'face' of element e (entry NLF*e +
+// face), precomputed in setUp: what femsweep_element otherwise derives
+// through the dependent loads elem_to_faces -> F_g2l -> idx1/idx2.
+struct FemsweepFace
+{
+  int32_t fs;         // 2 * interior face index + side s, or -1 (boundary face)
+  int32_t eu;         // upwind (neighbor) element
+  uint8_t src[FDS];   // local dofs of eu holding the face unknowns
+  uint8_t dst[FDS];   // local dofs of e receiving the face flux
+};
+
+// Fills ftab[NLF * ne]. Returns false if a face does not fit the table (dofs
+// of one face spanning elements, or indices beyond int32).
+inline bool femsweep_build_faces(Index_type ne, const Index_type* elem_to_faces,
+                                 const Index_type* F_g2l, const Index_type* idx1,
+                                 const Index_type* idx2, FemsweepFace* ftab)
+{
+  for (Index_type e = 0; e < ne; ++e) {
+    for (Index_type face = 0; face < NLF; ++face) {
+      FemsweepFace& fc = ftab[NLF * e + face];
+      const Index_type sf_gl = F_g2l[elem_to_faces[NLF * e + face]];
+      fc.fs = -1;
+      fc.eu = 0;
+      for (Index_type i = 0; i < FDS; ++i) { fc.src[i] = fc.dst[i] = 0; }
+      if (sf_gl < 0) {
+        continue;
+      }
+      const Index_type s = (e == idx1[sf_gl * FDS] / ND) ? 0 : 1;
+      const Index_type *const dsrc = (s == 0 ? idx2 : idx1) + sf_gl * FDS;
+      const Index_type *const ddst = (s == 0 ? idx1 : idx2) + sf_gl * FDS;
+      const Index_type eu = dsrc[0] / ND;
+      if (2 * sf_gl + 1 > INT32_MAX || eu > INT32_MAX) {
+        return false;
+      }
+      for (Index_type i = 0; i < FDS; ++i) {
+        if (dsrc[i] / ND != eu) {
+          return false;
+        }
+        fc.src[i] = static_cast<uint8_t>(dsrc[i] - eu * ND);
+        fc.dst[i] = static_cast<uint8_t>(ddst[i] % ND);
+      }
+      fc.fs = static_cast<int32_t>(2 * sf_gl + s);
+      fc.eu = static_cast<int32_t>(eu);
+    }
+  }
+  return true;
+}
+
 // Kernel data for femsweep_element.
 struct FemsweepData
 {
@@ -559,9 +609,11 @@ struct FemsweepData
   Real_ptr Xdat;
   const Index_type *AngleElem2FaceType, *elem_to_faces, *F_g2l, *idx1, *idx2;
   Index_type ne, ng, sharedinteriorfaces;
+  const FemsweepFace *ftab;   // only used by the FT code paths
 };
 
-// Prefetch what femsweep_element reads and writes for element e.
+// Prefetch what femsweep_element<FT> reads and writes for element e.
+template <bool FT = false>
 RAJA_INLINE void femsweep_prefetch(const FemsweepData& d, const Index_type e,
                                    const Index_type a, const Index_type g0,
                                    const Index_type nel)
@@ -575,12 +627,25 @@ RAJA_INLINE void femsweep_prefetch(const FemsweepData& d, const Index_type e,
   }
   __builtin_prefetch(d.Bdat + e * ND + a * ne * ND, 0, 3);
   const Index_type *const ft = d.AngleElem2FaceType + e * NLF + a * ne * NLF;
+  if constexpr (FT) {
+    __builtin_prefetch(d.ftab + NLF * e, 0, 3);
+    __builtin_prefetch(d.ftab + NLF * e + NLF - 1, 0, 3);
+  }
   for (Index_type face = 0; face < NLF; ++face) {
-    const Index_type sf_gl = d.F_g2l[d.elem_to_faces[NLF * e + face]];
+    Index_type sf_gl, s;
+    if constexpr (FT) {
+      const int32_t fs = d.ftab[NLF * e + face].fs;
+      sf_gl = fs >> 1;
+      s = fs & 1;
+    } else {
+      sf_gl = d.F_g2l[d.elem_to_faces[NLF * e + face]];
+    }
     if (ft[face] == 0 || sf_gl < 0) {
       continue;
     }
-    const Index_type s = (e == d.idx1[sf_gl * FDS] / ND) ? 0 : 1;
+    if constexpr (!FT) {
+      s = (e == d.idx1[sf_gl * FDS] / ND) ? 0 : 1;
+    }
     const Real_type *const Ff = d.Fdat + (s ^ 1) * FDS * FDS + sf_gl * 2 * FDS * FDS +
                                 a * d.sharedinteriorfaces * 2 * FDS * FDS;
     __builtin_prefetch(Ff, 0, 3);
@@ -598,7 +663,9 @@ RAJA_INLINE void femsweep_prefetch(const FemsweepData& d, const Index_type e,
 // an out-of-line function with an aligned frame: the LU spills to aligned
 // slots, face unknowns are gathered once per face, and x is written as one
 // contiguous row per group.
+// FT: face data from the precomputed d.ftab instead of the index chain.
 //
+template <bool FT = false>
 RAJAPERF_FEM_NOINLINE void femsweep_element(const FemsweepData& d,
                                             const Index_type e,
                                             const Index_type a,
@@ -630,6 +697,32 @@ RAJAPERF_FEM_NOINLINE void femsweep_element(const FemsweepData& d,
     b[j] = vset1(d.Bdat[j + e * ND + a * ne * ND]);
   }
   for (Index_type face = 0; face < NLF; ++face) {
+    if constexpr (FT) {
+      const FemsweepFace fc = d.ftab[NLF * e + face];
+      if ((AngleElem2FaceType[face + e * NLF + a * ne * NLF] == 0) || (fc.fs < 0)) {
+        continue;
+      }
+      const Index_type f = fc.fs >> 1;
+      const Index_type s = fc.fs & 1;
+      const Real_type *const Ff = d.Fdat + (s ^ 1) * FDS * FDS + f * 2 * FDS * FDS +
+                                  a * sharedinteriorfaces * 2 * FDS * FDS;
+      const Real_type *const xu = d.Xdat + xa + Index_type(fc.eu) * ND;
+      vd xg[FDS];
+      RAJAPERF_FEM_UNROLL
+      for (Index_type i = 0; i < FDS; i++) {
+        xg[i] = _mm512_i64gather_pd(xoff, xu + fc.src[i], 8);
+      }
+      RAJAPERF_FEM_UNROLL
+      for (Index_type j = 0; j < FDS; ++j) {
+        vd F = vzero();
+        RAJAPERF_FEM_UNROLL
+        for (Index_type i = 0; i < FDS; i++) {
+          F = vfma(vset1(Ffactor * Ff[i + j * FDS]), xg[i], F);
+        }
+        b[fc.dst[j]] = vsub(b[fc.dst[j]], F);
+      }
+      continue;
+    }
     const Index_type sf_gl = F_g2l[elem_to_faces[NLF * e + face]];
     const Index_type f = sf_gl >= 0 ? sf_gl : -1 - sf_gl;
     const Index_type s = (e == idx1[f * FDS] / ND) ? 0 : 1;
@@ -738,9 +831,9 @@ RAJAPERF_FEM_NOINLINE void femsweep_element(const FemsweepData& d,
 // FEMSWEEP_TEAM_SWEEP with femsweep_element. Element data is scattered in
 // memory (DRAM latency bound), so the element pfd steps ahead in the sweep
 // order is prefetched first. Tasks [t_begin, t_end) are shared by nt_ teams of
-// ts_ threads with barriers bar_.
+// ts_ threads with barriers bar_; ft selects the precomputed face table.
 #define FEMSWEEP_PF 2
-#define FEMSWEEP_TEAM_SWEEP_RANGE(slot, t_begin, t_end, ts_, nt_, bar_, pfd) \
+#define FEMSWEEP_TEAM_SWEEP_RANGE(slot, t_begin, t_end, ts_, nt_, bar_, pfd, ft) \
   { \
     const int team = (slot) / (ts_); \
     const int rank = (slot) % (ts_); \
@@ -757,8 +850,8 @@ RAJAPERF_FEM_NOINLINE void femsweep_element(const FemsweepData& d,
           const Index_type nehp = phpaa_r[ohp + hp]; \
           for (Index_type k = rank; k < nehp; k += (ts_)) { \
             const Index_type p = nehp_pos + k + (pfd) * (ts_); \
-            if (p < ne) { femsweep_prefetch(fd, orda[p], a, g0, nel); } \
-            femsweep_element(fd, orda[nehp_pos + k], a, g0, nel, Ffactor); \
+            if (p < ne) { femsweep_prefetch<ft>(fd, orda[p], a, g0, nel); } \
+            femsweep_element<ft>(fd, orda[nehp_pos + k], a, g0, nel, Ffactor); \
           } \
           if ((ts_) > 1) { (bar_)[team].wait((ts_), local_sense); } \
           nehp_pos += nehp; \
@@ -769,7 +862,7 @@ RAJAPERF_FEM_NOINLINE void femsweep_element(const FemsweepData& d,
 
 #define FEMSWEEP_TEAM_SWEEP_PF(slot) \
   FEMSWEEP_TEAM_SWEEP_RANGE(slot, 0, na * nbg, team_size, nteams, team_barriers, \
-                            FEMSWEEP_PF)
+                            FEMSWEEP_PF, false)
 
 
 class RunParams;
@@ -799,6 +892,8 @@ public:
   template < size_t tune_idx >
   void runOpenMPVariant(VariantID vid);
 
+  const FemsweepFace* faceTable() const { return m_ftab_ok ? m_ftab.data() : nullptr; }
+
   template < size_t block_size >
   void runCudaVariantImpl(VariantID vid);
   template < size_t block_size >
@@ -812,6 +907,9 @@ private:
 #endif
   using gpu_block_sizes_type = integer::make_gpu_block_size_list_type<default_gpu_block_size,
                                                          integer::MultipleOf<32>>;
+
+  std::vector<FemsweepFace> m_ftab;   // see femsweep_build_faces
+  bool m_ftab_ok = false;
 
   AngularQuadratureLite * m_angularquadrature;
   MeshGenerator * m_meshgen;

@@ -29,8 +29,16 @@ namespace apps
 // tune_idx 0: reference SoA sweep; 1: femsweep_element with prefetching
 // FEMSWEEP_PF elements ahead; 2, 3: as 1, prefetching 1 or 4 elements ahead;
 // 4: as 1, but the last, partial round of tasks is run by larger teams so
-// all threads stay busy.
+// all threads stay busy; 5: as 4 with the face data from a table
+// precomputed in setUp (FemsweepFace) instead of the elem_to_faces -> F_g2l
+// -> idx1/idx2 index chain.
 //
+// Two-phase sweep of tuning 4/5 for thread 'slot' (ft: use the face table).
+#define FEMSWEEP_MIXED_SWEEP(slot, ft) \
+  FEMSWEEP_TEAM_SWEEP_RANGE(slot, 0, t_split, 1, nthreads, team_barriers, pfd, ft); \
+  FEMSWEEP_TEAM_SWEEP_RANGE(slot, t_split, na * nbg, team_size2, nteams2, \
+                            team_barriers2, pfd, ft);
+
 template < size_t tune_idx >
 void FEMSWEEP::runOpenMPVariant(VariantID vid)
 {
@@ -42,7 +50,7 @@ void FEMSWEEP::runOpenMPVariant(VariantID vid)
 
   const FemsweepData fd{Bdat, Adat, Fdat, Sgdat, M0dat, Xdat,
                         AngleElem2FaceType, elem_to_faces, F_g2l, idx1, idx2,
-                        ne, ng, sharedinteriorfaces};
+                        ne, ng, sharedinteriorfaces, faceTable()};
   RAJA_UNUSED_VAR(fd);
 
   const Index_type nbg = (ng + FEM_VL - 1) / FEM_VL;
@@ -59,9 +67,10 @@ void FEMSWEEP::runOpenMPVariant(VariantID vid)
     while (team_size < 8 && nthreads / team_size > na * nbg) { team_size *= 2; }
     nteams = nthreads / team_size;
   }
-  // tune_idx 4: tasks [0, t_split) in full rounds of single-thread sweeps,
+  // tune_idx 4, 5: tasks [0, t_split) in full rounds of single-thread sweeps,
   // the remaining ones by nteams2 teams of team_size2 threads
-  const Index_type t_split = (tune_idx == 4) ? (na * nbg / nthreads) * nthreads : na * nbg;
+  const Index_type t_split = (tune_idx == 4 || tune_idx == 5)
+                           ? (na * nbg / nthreads) * nthreads : na * nbg;
   int team_size2 = 1;
   while (team_size2 < 8 && (na * nbg - t_split) * team_size2 * 2 <= nthreads) {
     team_size2 *= 2;
@@ -88,12 +97,16 @@ void FEMSWEEP::runOpenMPVariant(VariantID vid)
           if constexpr (tune_idx == 0) {
             FEMSWEEP_TEAM_SWEEP(slot);
           } else if constexpr (tune_idx == 4) {
-            FEMSWEEP_TEAM_SWEEP_RANGE(slot, 0, t_split, 1, nthreads, team_barriers, pfd);
-            FEMSWEEP_TEAM_SWEEP_RANGE(slot, t_split, na * nbg, team_size2, nteams2,
-                                      team_barriers2, pfd);
+            FEMSWEEP_MIXED_SWEEP(slot, false)
+          } else if constexpr (tune_idx == 5) {
+            if (fd.ftab != nullptr) {
+              FEMSWEEP_MIXED_SWEEP(slot, true)
+            } else {
+              FEMSWEEP_MIXED_SWEEP(slot, false)
+            }
           } else {
             FEMSWEEP_TEAM_SWEEP_RANGE(slot, 0, na * nbg, team_size, nteams,
-                                      team_barriers, pfd);
+                                      team_barriers, pfd, false);
           }
         }
         RP_CALI_SUBKERNEL_END("FEMSWEEP_1");
@@ -131,12 +144,16 @@ void FEMSWEEP::runOpenMPVariant(VariantID vid)
             if constexpr (tune_idx == 0) {
               FEMSWEEP_TEAM_SWEEP(islot);
             } else if constexpr (tune_idx == 4) {
-              FEMSWEEP_TEAM_SWEEP_RANGE(islot, 0, t_split, 1, nthreads, team_barriers, pfd);
-              FEMSWEEP_TEAM_SWEEP_RANGE(islot, t_split, na * nbg, team_size2, nteams2,
-                                        team_barriers2, pfd);
+              FEMSWEEP_MIXED_SWEEP(islot, false)
+            } else if constexpr (tune_idx == 5) {
+              if (fd.ftab != nullptr) {
+                FEMSWEEP_MIXED_SWEEP(islot, true)
+              } else {
+                FEMSWEEP_MIXED_SWEEP(islot, false)
+              }
             } else {
               FEMSWEEP_TEAM_SWEEP_RANGE(islot, 0, na * nbg, team_size, nteams,
-                                        team_barriers, pfd);
+                                        team_barriers, pfd, false);
             }
           });  // slot loop
         });
@@ -168,6 +185,7 @@ void FEMSWEEP::defineOpenMPVariantTunings()
     addVariantTuning<&FEMSWEEP::runOpenMPVariant<2>>(vid, "prefetch_pf1");
     addVariantTuning<&FEMSWEEP::runOpenMPVariant<3>>(vid, "prefetch_pf4");
     addVariantTuning<&FEMSWEEP::runOpenMPVariant<4>>(vid, "prefetch_mixed");
+    addVariantTuning<&FEMSWEEP::runOpenMPVariant<5>>(vid, "prefetch_mixed_ft");
   }
 }
 

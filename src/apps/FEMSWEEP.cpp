@@ -105,7 +105,8 @@ void FEMSWEEP::setSize(Index_type target_size, Index_type target_reps)
                            1*sizeof(Index_type) * NLF * m_ne + // elem_to_faces
                            1*sizeof(Index_type) * (m_sharedinteriorfaces + m_boundaryfaces) + // F_g2l
                            1*sizeof(Index_type) * m_sharedinteriorfaces * 4 + // idx1
-                           1*sizeof(Index_type) * m_sharedinteriorfaces * 4 );// idx2
+                           1*sizeof(Index_type) * m_sharedinteriorfaces * 4 + // idx2
+                           1*sizeof(FemsweepFace) * NLF * m_ne );// face table (OpenMP prefetch_mixed_ft)
   // using total data size instead of writes and reads
   setBytesReadPerRep( 1*sizeof(Real_type) * m_Blen + // Bdat
                       1*sizeof(Real_type) * m_Alen + // Adat
@@ -170,6 +171,13 @@ void FEMSWEEP::setUp(VariantID vid, size_t RAJAPERF_UNUSED_ARG(tune_idx))
 
   allocAndCopyHostData(m_idx2, m_meshgen->d_indices2.Data(), m_meshgen->d_indices2.Size(), vid);
 
+  // angle-independent face table, built from the host copies of the mesh
+  m_ftab.resize(NLF * m_ne);
+  m_ftab_ok = femsweep_build_faces(m_ne, m_meshgen->md_elem_to_faces.Data(),
+                                   m_meshgen->global_to_local_face.Data(),
+                                   m_meshgen->d_indices1.Data(),
+                                   m_meshgen->d_indices2.Data(), m_ftab.data());
+
   delete m_angularquadrature;
   m_angularquadrature = nullptr;
   delete m_meshgen;
@@ -201,6 +209,9 @@ void FEMSWEEP::tearDown(VariantID vid, size_t RAJAPERF_UNUSED_ARG(tune_idx))
   deallocData(m_F_g2l             , vid);
   deallocData(m_idx1              , vid);
   deallocData(m_idx2              , vid);
+
+  std::vector<FemsweepFace>().swap(m_ftab);
+  m_ftab_ok = false;
 }
 
 } // end namespace apps
