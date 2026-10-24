@@ -183,6 +183,7 @@ usually beats everything else. Patterns that generalize:
 | **Batch independent problems** | many tiny identical solves | SIMD across problems |
 | Symmetry | $M_{ij} = M_{ji}$ and similar | compute half |
 | Hoisting / precompute | loop-invariant tables or factors | fewer operations per item |
+| **Hoist into setup (mesh / data-structure precomputation)** | the kernel re-derives the same per-entity data on every sweep, repetition or outer index (angle, group, time step), e.g. a chain of dependent index loads `a[b[c[i]]]` or small geometric factors | build a compact table once at initialization and read it directly; shorter dependency chains and fewer instructions per item; see below |
 | Recompute vs load | memory-bound kernel reading cheaply derivable data | less traffic, but this changes the benchmark input, so flag it |
 
 Rules:
@@ -201,6 +202,50 @@ Rules:
   tolerance (about 1e-12 for double), and state whether the result is
   bit-exact.
 - Do not silently change the benchmark's inputs or semantics.
+
+### Hoisting dynamic work into initialization
+
+Ask for every value the kernel computes per item: **does it depend on
+anything that changes between sweeps?** Work that depends only on the
+mesh or the data structures, not on the loop over angles, groups, time steps
+or repetitions, can be computed once when the grid, mesh or data
+structures are set up, and stored in a small table the kernel reads.
+
+1. **Find the candidates.** For each per-item computation, list the indices
+   it actually depends on. Typical finds:
+   - chains of dependent index loads (connectivity → local numbering →
+     global index), recomputed for every angle or group;
+   - branch conditions and side/orientation flags derived from connectivity;
+   - geometric factors (normals, Jacobians, face areas) of a static mesh.
+   Profiling signs: L1-bound or latency-bound loads feeding a gather, and an
+   instruction count per item far above the arithmetic it needs.
+2. **Size the table before building it.** It has one entry per invariant
+   entity (e.g. element × local face), not per item of the full iteration
+   space. Compare it with the total footprint and the LLC: aim for well
+   under 1% of the footprint, and ideally a size that stays cache-resident.
+   - Pack it: narrow integer types, local (small-range) indices instead of
+     global ones, flags folded into spare bits, and a record size that
+     divides the cache line (e.g. 16 bytes) so an item's entries share few
+     lines.
+   - Store only what the kernel needs after the derivation (e.g. the final
+     offsets), not the intermediate indices.
+   - If the honest table would be large (per angle, per group), it is a
+     traffic trade, not a hoist: on a memory-bound kernel it can be slower.
+3. **Keep it general and safe.** The builder checks the assumptions the
+   compact form relies on (index ranges fit, entries of one face belong to
+   one neighbour, ...) and reports failure; the kernel then falls back to the
+   original derivation. The original arrays stay the benchmark's inputs.
+4. **Account for it.** Build it in setup, outside the timed region, and add
+   its size to the reported allocated bytes. It changes the data structures
+   the kernel reads, so make it a separately named tuning and state the
+   footprint increase. Ask before doing it when the user owns the benchmark
+   definition.
+5. **Verify and measure.**
+   - Checksums should be identical to the derivation it replaces.
+   - Confirm the table path actually runs, since a fallback gives the same
+     checksum. Use instruction counts per item or a debug counter.
+   - Expect the gain to be largest on one core and to shrink at full thread
+     count once the kernel reaches the bandwidth limit.
 
 ## Stage 4: Intrinsics and streaming stores
 
@@ -301,7 +346,7 @@ batch. Each instruction then has NV independent copies in flight.
   them and NV > 1 only adds spills. If the kernel is L1-bound on chains of
   dependent index loads (`a[b[c[i]]]` feeding a gather), neither
   interleaving nor replacing the gather helps; only shortening the index
-  chain does.
+  chain does (see "Hoisting dynamic work into initialization").
 
 ### 4e. Streaming (non-temporal) stores
 Use them only when the output is **write-only, written in full cache lines,
