@@ -9,6 +9,9 @@
 #   ./run_emr_priority.sh build    # configure + build both source trees
 #   ./run_emr_priority.sh run      # run; must be called inside an allocation
 #   ./run_emr_priority.sh report   # write $WORK/results/summary.{md,csv}
+#   ./run_emr_priority.sh sweep    # build, allocate, run all kernels/tunings at 3 problem
+#                                  # sizes (suite default, fits in LLC, exceeds LLC), report
+#   ./run_emr_priority.sh sweep-run / sweep-report   # the two halves of 'sweep'
 #
 # Environment overrides:
 #   WORK         work directory                 (default: <repo>/emr_priority)
@@ -29,6 +32,9 @@
 #   FORCE_BUILD  rebuild even if binaries exist: 1, main or vec (default: 0)
 #   KERNELS      space-separated subset of the kernels below (default: all 10)
 #   RESULTS      results directory                (default: $WORK/results)
+#   Size sweep: SWEEP (default $WORK/size_sweep; report in $SWEEP/SIZE_SWEEP.md),
+#   REGIMES (default "default fit exceed"), FIT_FRAC (0.25 x LLC), EXCEED_FACT (8 x LLC),
+#   LLC_MB (default: read from sysfs on the node, else 320)
 #
 set -euo pipefail
 
@@ -79,6 +85,17 @@ CHANGED="${CHANGED:-EDGE3D DIFFUSION3DPA FEMSWEEP MASS3DEA MASS3DPA_ATOMIC MASSV
 
 PERF_VARIANTS="Base_OpenMP Lambda_OpenMP RAJA_OpenMP"
 CHECK_VARIANTS="Base_Seq $PERF_VARIANTS"
+
+# Prints "--size N" for kernel $1: from $SIZES_FILE ("kernel size" lines, size 0
+# = suite default, prints nothing) when set, otherwise from SIZE[].
+size_args() {
+  local s="${SIZE[$1]}"
+  if [[ -n "${SIZES_FILE:-}" ]]; then
+    s="$(awk -v k="$1" '$1 == k {print $2}' "$SIZES_FILE")"
+  fi
+  if [[ -n "$s" && "$s" != 0 ]]; then echo "--size $s"; fi
+  return 0
+}
 
 make_src() {
   local dir=$1 ref=$2
@@ -141,7 +158,7 @@ do_run() {
       local out="$RESULTS/check/$b/$k"
       mkdir -p "$out"
       srun "$WORK/build-$b/bin/raja-perf.exe" --kernels "$k" --variants $CHECK_VARIANTS \
-        --size "${SIZE[$k]}" --checkrun 1 --outdir "$out" > "$out/stdout.txt" 2>&1 \
+        $(size_args "$k") --checkrun 1 --outdir "$out" > "$out/stdout.txt" 2>&1 \
         || echo "check $b $k: raja-perf.exe exited with $?"
       # informational only (files may lag on NFS); 'report' does the real check
       echo "check $b $k: $(grep -sc PASSED "$out/RAJAPerf-checksum.txt" || true) passed," \
@@ -157,7 +174,7 @@ do_run() {
         mkdir -p "$out"
         local st=0
         srun "$WORK/build-$b/bin/raja-perf.exe" --kernels "$k" --variants $PERF_VARIANTS \
-          --size "${SIZE[$k]}" --npasses "$NPASSES" --outdir "$out" > "$out/stdout.txt" 2>&1 || st=$?
+          $(size_args "$k") --npasses "$NPASSES" --outdir "$out" > "$out/stdout.txt" 2>&1 || st=$?
         echo "perf run $rep $b $k: exit $st"
       done
     done
@@ -278,7 +295,183 @@ print(open(f"{R}/summary.md").read())
 EOF
 }
 
+# ---------------------------------------------------------------------------
+# Problem-size sweep: every kernel at three footprints, relative to the LLC
+#   default : the suite's default size (no --size)
+#   fit     : BytesAllocated/rep ~= FIT_FRAC    x LLC   (cache resident)
+#   exceed  : BytesAllocated/rep ~= EXCEED_FACT x LLC   (clearly DRAM bound)
+# Sizes are calibrated with probe runs of the vec build so every kernel hits the
+# same footprint relative to the LLC; each regime then runs the normal
+# correctness + performance protocol (do_run) into $SWEEP/<regime>.
+# ---------------------------------------------------------------------------
+SWEEP="${SWEEP:-$WORK/size_sweep}"
+REGIMES="${REGIMES:-default fit exceed}"
+FIT_FRAC="${FIT_FRAC:-0.25}"
+EXCEED_FACT="${EXCEED_FACT:-8}"
+
+# probe KERNEL SIZE(0=default) -> "<problem size> <BytesAllocated/rep>"
+probe() {
+  local k=$1 s=$2 out="$SWEEP/probe/$1.$2"
+  mkdir -p "$out"
+  local sz=()
+  if [[ "$s" != 0 ]]; then sz=(--size "$s"); fi
+  srun "$WORK/build-vec/bin/raja-perf.exe" --kernels "$k" --variants Base_OpenMP \
+    "${sz[@]}" --checkrun 1 --outdir "$out" > "$out/stdout.txt" 2>&1 || true
+  python3 - "$out/RAJAPerf-kernel-details.csv" << 'EOF'
+import csv, sys
+rows = [[c.strip() for c in r] for r in csv.reader(open(sys.argv[1]))]
+h = next(i for i, r in enumerate(rows) if r and r[0] == "Kernel")
+c = {n: i for i, n in enumerate(rows[h])}
+r = rows[h + 1]
+print(r[c["Problem size"]], r[c["BytesAllocated/rep"]])
+EOF
+}
+
+do_sweep_sizes() {
+  mkdir -p "$SWEEP"
+  local llc_kb llc_bytes
+  llc_kb="$(srun cat /sys/devices/system/cpu/cpu0/cache/index3/size 2>/dev/null | head -1 | tr -d 'K' || true)"
+  if [[ -n "${LLC_MB:-}" ]]; then llc_bytes=$(python3 -c "print(int(float('$LLC_MB')*2**20))")
+  elif [[ -n "$llc_kb" ]]; then llc_bytes=$((llc_kb * 1024))
+  else llc_bytes=$((320 * 1024 * 1024)); echo "warning: LLC size unknown, assuming 320 MiB" >&2; fi
+  echo "LLC = $llc_bytes bytes"
+  echo "kernel,regime,size,bytes_alloc,llc_bytes" > "$SWEEP/sizes.csv"
+  : > "$SWEEP/.sizes.tmp"
+  for k in "${KERNEL_LIST[@]}"; do
+    local d_size d_bytes
+    read -r d_size d_bytes <<< "$(probe "$k" 0)"
+    echo "$k,default,$d_size,$d_bytes,$llc_bytes" >> "$SWEEP/sizes.csv"
+    echo "$k default 0" >> "$SWEEP/.sizes.tmp"
+    for reg in fit exceed; do
+      local target s sz b
+      if [[ $reg == fit ]]; then target=$(python3 -c "print($FIT_FRAC*$llc_bytes)")
+      else target=$(python3 -c "print($EXCEED_FACT*$llc_bytes)"); fi
+      sz="$d_size"; b="$d_bytes"
+      # bytes/rep is ~linear in size: rescale from the last probe, twice
+      for _ in 1 2; do
+        s=$(python3 -c "print(max(1, round($sz*$target/$b)))")
+        read -r sz b <<< "$(probe "$k" "$s")"
+      done
+      echo "$k,$reg,$sz,$b,$llc_bytes" >> "$SWEEP/sizes.csv"
+      echo "$k $reg $sz" >> "$SWEEP/.sizes.tmp"
+    done
+  done
+  for reg in $REGIMES; do
+    awk -v r="$reg" '$2 == r {print $1, $3}' "$SWEEP/.sizes.tmp" > "$SWEEP/sizes_$reg.txt"
+  done
+  rm -f "$SWEEP/.sizes.tmp"
+  column -s, -t "$SWEEP/sizes.csv"
+}
+
+do_sweep_run() {
+  if [[ -z "${SLURM_JOB_ID:-}" ]]; then
+    echo "error: 'sweep-run' must be executed inside a Slurm allocation" >&2
+    exit 1
+  fi
+  do_sweep_sizes
+  for reg in $REGIMES; do
+    echo "=== regime: $reg ==="
+    SIZES_FILE="$SWEEP/sizes_$reg.txt" RESULTS="$SWEEP/$reg" do_run
+  done
+}
+
+do_sweep_report() {
+  local reg
+  for reg in $REGIMES; do
+    RESULTS="$SWEEP/$reg" do_report > /dev/null
+  done
+  SWEEP="$SWEEP" REGIMES="$REGIMES" LM="$MAIN_LABEL" LV="$VEC_LABEL" NTHREADS="$NTHREADS" \
+  NREP="$NREP" NPASSES="$NPASSES" FIT_FRAC="$FIT_FRAC" EXCEED_FACT="$EXCEED_FACT" python3 - << 'EOF'
+import csv, math, os
+
+S = os.environ["SWEEP"]
+regs = os.environ["REGIMES"].split()
+LM, LV = os.environ["LM"], os.environ["LV"]
+MiB = 2**20
+sizes = {}
+for r in csv.DictReader(open(f"{S}/sizes.csv")):
+    sizes[(r["kernel"], r["regime"])] = (int(r["size"]), int(r["bytes_alloc"]), int(r["llc_bytes"]))
+data = {}
+for reg in regs:
+    for r in csv.DictReader(open(f"{S}/{reg}/summary.csv")):
+        data[(r["kernel"], r["variant"], reg)] = r
+kernels = list(dict.fromkeys(k for k, _ in sizes))
+llc = next(iter(sizes.values()))[2]
+desc = {"default": "suite default size",
+        "fit": f"working set ~{float(os.environ['FIT_FRAC']):g} x LLC (cache resident)",
+        "exceed": f"working set ~{float(os.environ['EXCEED_FACT']):g} x LLC (DRAM bound)"}
+node = ""
+p = f"{S}/{regs[0]}/node-info.txt"
+if os.path.exists(p):
+    node = open(p).read().strip()
+
+out = [f"# Problem-size sweep: {LM} vs {LV}\n",
+       f"LLC = {llc/MiB:.0f} MiB. OMP_NUM_THREADS={os.environ['NTHREADS']}; median of "
+       f"{os.environ['NREP']} interleaved runs x {os.environ['NPASSES']} passes. "
+       f"Speedup = t/rep of the {LM} default tuning divided by t/rep of the {LV} variant/tuning "
+       "(>1 is faster). GB/s uses RAJAPerf's nominal byte counts: values above the measured DRAM "
+       "peak mean the data was served from cache, not that DRAM was beaten. "
+       "Per-regime full tables: `<regime>/summary.md`.\n",
+       "```\n" + node + "\n```\n", "## Regimes\n",
+       "| Kernel | " + " | ".join(f"{g} size | {g} WS MiB (x LLC)" for g in regs) + " |",
+       "|---|" + "---:|---:|" * len(regs)]
+for k in kernels:
+    cells = []
+    for g in regs:
+        z, b, _ = sizes[(k, g)]
+        cells += [str(z), f"{b/MiB:.1f} ({b/llc:.2f}x)"]
+    out.append(f"| {k} | " + " | ".join(cells) + " |")
+out.append("\n" + "; ".join(f"**{g}**: {desc[g]}" for g in regs) + "\n")
+
+out += ["## Best-tuning speedup per regime\n",
+        "| Kernel | " + " | ".join(regs) + " |", "|---|" + "---:|" * len(regs)]
+best = {}
+for k in kernels:
+    cells = []
+    for g in regs:
+        sps = [float(r["speedup"]) for (kk, _, gg), r in data.items() if kk == k and gg == g]
+        best[(k, g)] = max(sps) if sps else None
+        cells.append(f"{max(sps):.2f}x" if sps else "-")
+    out.append(f"| {k} | " + " | ".join(cells) + " |")
+gm = []
+for g in regs:
+    xs = [best[(k, g)] for k in kernels if best[(k, g)]]
+    gm.append(f"**{math.exp(sum(map(math.log, xs)) / len(xs)):.2f}x**" if xs else "-")
+out.append("| **geomean** | " + " | ".join(gm) + " |\n")
+
+out.append("## Per-kernel results (every variant and tuning)\n")
+for k in kernels:
+    out.append(f"### {k}\n")
+    variants = list(dict.fromkeys(v for (kk, v, _) in data if kk == k))
+    out.append("| Variant | " + " | ".join(
+        f"{g}: {LM} GB/s | {g}: {LV} GB/s | {g}: speedup" for g in regs) + " | Checks |")
+    out.append("|---|" + "---:|---:|---:|" * len(regs) + ":-:|")
+    for v in variants:
+        cells, chk = [], set()
+        for g in regs:
+            r = data.get((k, v, g))
+            if r:
+                cells += [f"{float(r['gbs_main']):.1f}", f"{float(r['gbs_vec']):.1f}",
+                          f"{float(r['speedup']):.2f}x"]
+                chk.add(r["checks"])
+            else:
+                cells += ["-", "-", "-"]
+        out.append(f"| {v} | " + " | ".join(cells) + f" | {'/'.join(sorted(chk)) or '-'} |")
+    out.append("")
+open(f"{S}/SIZE_SWEEP.md", "w").write("\n".join(out) + "\n")
+print(f"wrote {S}/SIZE_SWEEP.md")
+EOF
+}
+
 case "${1:-all}" in
+  sweep-run)    do_sweep_run ;;
+  sweep-report) do_sweep_report ;;
+  sweep)
+    do_build
+    # shellcheck disable=SC2086
+    salloc $SALLOC_ARGS "$SCRIPT" sweep-run
+    do_sweep_report
+    ;;
   build)  do_build ;;
   run)    do_run ;;
   report) do_report ;;
@@ -288,5 +481,5 @@ case "${1:-all}" in
     salloc $SALLOC_ARGS "$SCRIPT" run
     do_report
     ;;
-  *) echo "usage: $0 [all|build|run|report]" >&2; exit 1 ;;
+  *) echo "usage: $0 [all|build|run|report|sweep|sweep-run|sweep-report]" >&2; exit 1 ;;
 esac
