@@ -411,6 +411,8 @@ out = [f"# Problem-size sweep: {LM} vs {LV}\n",
        f"Speedup = t/rep of the {LM} default tuning divided by t/rep of the {LV} variant/tuning "
        "(>1 is faster). GB/s uses RAJAPerf's nominal byte counts: values above the measured DRAM "
        "peak mean the data was served from cache, not that DRAM was beaten. "
+       "GFLOP/s likewise uses RAJAPerf's nominal per-kernel FLOP counts. "
+       "Tunings are described in [TUNINGS.md](../TUNINGS.md). "
        "Per-regime full tables: `<regime>/summary.md`.\n",
        "```\n" + node + "\n```\n", "## Regimes\n",
        "| Kernel | " + " | ".join(f"{g} size | {g} WS MiB (x LLC)" for g in regs) + " |",
@@ -439,23 +441,31 @@ for g in regs:
     gm.append(f"**{math.exp(sum(map(math.log, xs)) / len(xs)):.2f}x**" if xs else "-")
 out.append("| **geomean** | " + " | ".join(gm) + " |\n")
 
+def ftime(t):
+    t = float(t)
+    return f"{t*1e3:.3f} ms" if t >= 1e-3 else f"{t*1e6:.1f} us"
+
 out.append("## Per-kernel results (every variant and tuning)\n")
 for k in kernels:
     out.append(f"### {k}\n")
     variants = list(dict.fromkeys(v for (kk, v, _) in data if kk == k))
     out.append("| Variant | " + " | ".join(
-        f"{g}: {LM} GB/s | {g}: {LV} GB/s | {g}: speedup" for g in regs) + " | Checks |")
-    out.append("|---|" + "---:|---:|---:|" * len(regs) + ":-:|")
+        f"{g}: {LM} t/rep | {g}: {LV} t/rep | {g}: {LM} GB/s | {g}: {LV} GB/s "
+        f"| {g}: {LM} GFLOP/s | {g}: {LV} GFLOP/s | {g}: speedup"
+        for g in regs) + " | Checks |")
+    out.append("|---|" + "---:|" * 7 * len(regs) + ":-:|")
     for v in variants:
         cells, chk = [], set()
         for g in regs:
             r = data.get((k, v, g))
             if r:
-                cells += [f"{float(r['gbs_main']):.1f}", f"{float(r['gbs_vec']):.1f}",
+                cells += [ftime(r["t_main"]), ftime(r["t_vec"]),
+                          f"{float(r['gbs_main']):.1f}", f"{float(r['gbs_vec']):.1f}",
+                          f"{float(r['gf_main']):.1f}", f"{float(r['gf_vec']):.1f}",
                           f"{float(r['speedup']):.2f}x"]
                 chk.add(r["checks"])
             else:
-                cells += ["-", "-", "-"]
+                cells += ["-"] * 7
         out.append(f"| {v} | " + " | ".join(cells) + f" | {'/'.join(sorted(chk)) or '-'} |")
     out.append("")
 open(f"{S}/SIZE_SWEEP.md", "w").write("\n".join(out) + "\n")
