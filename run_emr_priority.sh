@@ -34,7 +34,9 @@
 #   RESULTS      results directory                (default: $WORK/results)
 #   Size sweep: SWEEP (default $WORK/size_sweep; report in $SWEEP/SIZE_SWEEP.md),
 #   REGIMES (default "default fit exceed"), FIT_FRAC (0.25 x LLC), EXCEED_FACT (8 x LLC),
-#   LLC_MB (default: read from sysfs on the node, else 320)
+#   LLC_MB (default: read from sysfs on the node, else 320), REUSE_SIZES=1 (keep an existing
+#   $SWEEP/sizes.csv and sizes_<regime>.txt instead of recalibrating, e.g. to compare another
+#   tree at identical sizes)
 #
 set -euo pipefail
 
@@ -368,7 +370,11 @@ do_sweep_run() {
     echo "error: 'sweep-run' must be executed inside a Slurm allocation" >&2
     exit 1
   fi
-  do_sweep_sizes
+  if [[ "${REUSE_SIZES:-0}" == 1 && -f "$SWEEP/sizes.csv" ]]; then
+    echo "reusing sizes from $SWEEP/sizes.csv"
+  else
+    do_sweep_sizes
+  fi
   for reg in $REGIMES; do
     echo "=== regime: $reg ==="
     SIZES_FILE="$SWEEP/sizes_$reg.txt" RESULTS="$SWEEP/$reg" do_run
