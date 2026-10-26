@@ -22,7 +22,9 @@ namespace apps {
 
 
 // tune_idx 0: default; 1, 2, 3: AVX-512 batches with software prefetch of D
-// and ElemToDoF 1, 2, 4 batches ahead
+// and ElemToDoF 1, 2, 4 batches ahead; 4: "row" (whole x-rows, 4 row
+// colors, gather-free 8-element blocks); 5: "row" with the X and Y node rows
+// of the next block prefetched
 template <size_t tune_idx>
 void MASS3DPA_ATOMIC::runOpenMPVariant(VariantID vid) {
 
@@ -37,12 +39,45 @@ void MASS3DPA_ATOMIC::runOpenMPVariant(VariantID vid) {
   const Index_type Nz = m_Nz;
   const Index_type nby = (Ny + MPAT_ROW_BLOCK - 1) / MPAT_ROW_BLOCK;
   const Index_type nbz = (Nz + MPAT_ROW_BLOCK - 1) / MPAT_ROW_BLOCK;
-  constexpr int PF = tune_idx == 0 ? 0 : (tune_idx == 1 ? 1 : (tune_idx == 2 ? 2 : 4));
+  constexpr int PF = (tune_idx == 0 || tune_idx == 4) ? 0
+                     : (tune_idx == 5) ? 100
+                     : (tune_idx == 1 ? 1 : (tune_idx == 2 ? 2 : 4));
   RAJA_UNUSED_VAR(PF);
+  constexpr bool ROW = tune_idx >= 4;
+  if constexpr (ROW) {
+    if (!m_row_structured) {
+      runOpenMPVariant<0>(vid);
+      return;
+    }
+  }
 
   switch (vid) {
 
   case Base_OpenMP: {
+
+#if defined(RAJAPERF_FEM_AVX512)
+    if constexpr (ROW) {
+      startTimer();
+      // Loop counter increment uses macro to quiet C++20 compiler warning
+      for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
+
+RP_CALI_SUBKERNEL_BEGIN("MASS3DPA_ATOMIC_1");
+#pragma omp parallel
+        for (Index_type c = 0; c < 4; ++c) {
+          const Index_type nrow = ((Ny - (c & 1) + 1) / 2) * ((Nz - (c >> 1) + 1) / 2);
+#pragma omp for schedule(static)
+          for (Index_type r = 0; r < nrow; ++r) {
+            MPAT_COLOR_ROW(c, r);
+            mass3dpa_atomic_row_avx512<PF>(B, D, X, Y, ElemToDoF,
+                                           Nx * (ey + Ny * ez), Nx, NE);
+          }
+        }
+RP_CALI_SUBKERNEL_END("MASS3DPA_ATOMIC_1");
+      }
+      stopTimer();
+      break;
+    }
+#endif
 
     startTimer();
     // Loop counter increment uses macro to quiet C++20 compiler warning
@@ -125,6 +160,39 @@ RP_CALI_SUBKERNEL_END("MASS3DPA_ATOMIC_1");
     using inner_y = RAJA::LoopPolicy<RAJA::seq_exec>;
 
     using inner_z = RAJA::LoopPolicy<RAJA::seq_exec>;
+#endif
+
+#if defined(RAJAPERF_FEM_AVX512)
+    if constexpr (ROW) {
+      startTimer();
+      // Loop counter increment uses macro to quiet C++20 compiler warning
+      for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
+
+        RP_CALI_SUBKERNEL_BEGIN("MASS3DPA_ATOMIC_1");
+        RAJA::launch<launch_policy>( res,
+          RAJA::LaunchParams(),
+          [=] RAJA_HOST_DEVICE(RAJA::LaunchContext ctx) {
+
+           for (Index_type c = 0; c < 4; ++c) {
+            const Index_type nrow = ((Ny - (c & 1) + 1) / 2) * ((Nz - (c >> 1) + 1) / 2);
+
+            RAJA::loop<outer_x>(ctx, RAJA::RangeSegment(0, nrow),
+              [&](Index_type r) {
+                MPAT_COLOR_ROW(c, r);
+                mass3dpa_atomic_row_avx512<PF>(B, D, X, Y, ElemToDoF,
+                                               Nx * (ey + Ny * ez), Nx, NE);
+              }
+            );  // RAJA::loop<outer_x>, implicit barrier between colors
+           }  // color loop
+
+          }  // outer lambda (ctx)
+        );  // RAJA::launch
+        RP_CALI_SUBKERNEL_END("MASS3DPA_ATOMIC_1");
+
+      }  // loop over kernel reps
+      stopTimer();
+      return;
+    }
 #endif
 
     startTimer();
@@ -312,6 +380,8 @@ void MASS3DPA_ATOMIC::defineOpenMPVariantTunings()
     addVariantTuning<&MASS3DPA_ATOMIC::runOpenMPVariant<1>>(vid, "pf1");
     addVariantTuning<&MASS3DPA_ATOMIC::runOpenMPVariant<2>>(vid, "pf2");
     addVariantTuning<&MASS3DPA_ATOMIC::runOpenMPVariant<3>>(vid, "pf4");
+    addVariantTuning<&MASS3DPA_ATOMIC::runOpenMPVariant<4>>(vid, "row");
+    addVariantTuning<&MASS3DPA_ATOMIC::runOpenMPVariant<5>>(vid, "row_pf");
 #endif
   }
 }

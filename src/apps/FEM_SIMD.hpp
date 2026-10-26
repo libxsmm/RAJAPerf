@@ -296,6 +296,37 @@ RAJA_INLINE void mass_pa_apply(const Real_type (&b)[Q1][D1],
   }
 }
 
+// 8 overlapping 3-node segments of a contiguous 17-node row p[0..16]
+// (segment k = p[2k..2k+2], e.g. the nodes of 8 consecutive quadratic
+// elements along x): v[dx] lane k = p[2k + dx]. No gathers.
+RAJA_INLINE void load_seg3_x8(const Real_type *p, vd (&v)[3]) {
+  const __m512i even = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+  const __m512i odd = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
+  const vd a0 = vload(p);
+  const vd a8 = vload(p + 8);
+  const vd b1 = vload(p + 1);
+  const vd b9 = vload(p + 9);
+  v[0] = _mm512_permutex2var_pd(a0, even, a8);
+  v[1] = _mm512_permutex2var_pd(a0, odd, a8);
+  v[2] = _mm512_permutex2var_pd(b1, odd, b9);
+}
+
+// Transpose of load_seg3_x8: p[2k + dx] += v[dx] lane k. The shared node
+// p[2k+2] (k < 7) receives v[2]_k + v[0]_{k+1}, so every node is updated by
+// exactly one plain read-modify-write (no conflicts, no scatters).
+RAJA_INLINE void add_seg3_x8(Real_type *p, const vd (&v)[3]) {
+  const __m512i ilo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+  const __m512i ihi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
+  // [0, v2_0, ..., v2_6]
+  const vd v2s = _mm512_castsi512_pd(_mm512_alignr_epi64(
+      _mm512_castpd_si512(v[2]), _mm512_setzero_si512(), 7));
+  const vd ev = vadd(v[0], v2s);
+  vstore(p, vadd(vload(p), _mm512_permutex2var_pd(ev, ilo, v[1])));
+  vstore(p + 8, vadd(vload(p + 8), _mm512_permutex2var_pd(ev, ihi, v[1])));
+  // p[16] += v2_7 (lane 7 of a vector at p + 9)
+  vstore(p + 9, vmask(0x80), vadd(vload(vmask(0x80), p + 9), v[2]));
+}
+
 } // namespace fem_simd
 } // namespace rajaperf
 
