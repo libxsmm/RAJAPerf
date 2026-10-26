@@ -115,6 +115,7 @@ All checksums pass. Ratio = other's fastest variant / ours (>1 = ours faster):
 | VOL3D | `strip_nt` | 0.99x | 0.96x | 1.00x | 0.87x (`blocked`) |
 | NODAL_ACCUMULATION_3D | `blocked` | 1.10x | 0.73x | 1.03x | 0.78x (`default`) |
 | MASS3DEA | `sumfact_nt_seq` | 1.07x | 1.00x | 1.01x | 0.86x (`sumfact_nt`) |
+| MASS3DPA_ATOMIC | `row_pf` \* | 1.61x | 1.66x | 1.05x | 0.84x (`pf1`) |
 
 - **ENERGY:** the other tree's lead did not come from streaming stores (its ENERGY has
   none). It came from hand-written AVX-512 that tests the rarely taken `delvc <= 0`
@@ -128,6 +129,12 @@ All checksums pass. Ratio = other's fastest variant / ours (>1 = ours faster):
 - **NODAL_ACCUMULATION_3D:** cache blocking of our gather (64-row j blocks x k slabs,
   about one unit per thread) keeps plane k-1 in L2. With 16-row blocks the halo row
   re-reads left it 4% behind (0.96x).
+- **MASS3DPA_ATOMIC:** like the other tree, `row` uses the structured element rows: X is
+  loaded contiguously with permutes and Y updated with plain read-modify-writes, instead
+  of our gathers and masked scatters. `setUp` verifies the row structure and falls back
+  to the default path otherwise. \* Measured in a separate job (same node type and
+  sizes; `emr_m3pa`, 3 passes), against the other tree's times from the original
+  comparison.
 - **MASS3DEA:** our `sumfact_nt` streamed 8 interleaved element rows per thread (lane =
   element). Staging the batch and streaming each element's 8 KB slice contiguously
   reaches the other tree's pure streaming-write rate.

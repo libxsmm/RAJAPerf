@@ -93,6 +93,8 @@ scattered in two passes (even lanes, then odd lanes).
 |---|---|
 | `default` | AVX-512 batch kernel (gather, transpose, masked scatter) without prefetch. |
 | `pf1`, `pf2`, `pf4` | `default` with software prefetch of D and ElemToDoF 1, 2 or 4 batches ahead. **AVX-512 only.** |
+| `row` | Whole x-rows per thread in 4 row colors; 8 consecutive elements of a row per batch (lane = element). On the structured mesh each node row of a batch is 17 contiguous dofs, so X is loaded with plain loads + even/odd permutes and Y is updated with plain read-modify-writes, the dof shared by neighbouring lanes summed in registers: no gathers, scatters or atomics. `setUp` verifies the structured form of ElemToDoF; otherwise the default path runs. **AVX-512 only.** |
+| `row_pf` | `row` with the X and Y node rows of the next block prefetched. **AVX-512 only.** |
 
 ### MASSVEC3DPA (Base, RAJA)
 
@@ -123,7 +125,7 @@ scattered in two passes (even lanes, then odd lanes).
 
 Best tuning per problem-size regime on a 64-core Xeon 8592+ (see
 [size_sweep/SIZE_SWEEP.md](size_sweep/SIZE_SWEEP.md); the `fused_skip*`, `strip*`,
-NODAL `blocked` and `sumfact_nt_seq` tunings were measured later at the same sizes,
+NODAL `blocked`, `sumfact_nt_seq` and MASS3DPA_ATOMIC `row*` tunings were measured later at the same sizes,
 see [compare_other/COMPARISON.md](compare_other/COMPARISON.md)). `fit` is a working set of about
 0.25x LLC; `exceed` is about 8x LLC.
 
@@ -135,7 +137,7 @@ see [compare_other/COMPARISON.md](compare_other/COMPARISON.md)). `fit` is a work
 | FEMSWEEP | `prefetch_mixed_ft` | `prefetch_mixed_ft` |
 | INTSC_HEXRECT | `split_simd` | `split_simd` |
 | MASS3DEA | `sumfact` | `sumfact_nt_seq` |
-| MASS3DPA_ATOMIC | `pf1` / `default` | `pf1` |
+| MASS3DPA_ATOMIC | `row_pf` | `row_pf` |
 | MASSVEC3DPA | `default` | `nt_pf1` |
 | NODAL_ACCUMULATION_3D | `default` | `blocked` |
 | VOL3D | `default` / `strip` | `strip_nt` |
