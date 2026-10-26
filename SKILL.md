@@ -1,6 +1,6 @@
 ---
 name: hpc-kernel-optimization
-description: 'Staged CPU optimization workflow for HPC loop kernels (finite element, stencil, streaming, geometry, many small dense solves). Use when: optimizing or vectorizing a compute kernel; deciding if a kernel is compute, memory, latency or cache bound; roofline analysis; AoS to SoA conversion or element batching; removing atomics; loop fusion; sum factorization; algebraic reformulation; GEMM-like register blocking of small matrix assembly; multi-vector batches for ILP; SIMD intrinsics (AVX-512, AVX2, SVE, NEON); forcing FMA; streaming or non-temporal stores; checking whether GFLOP/s or GB/s above peak is real; comparing an optimized branch against a baseline.'
+description: 'Staged CPU optimization workflow for HPC loop kernels (finite element, stencil, streaming, geometry, many small dense solves). Use when: optimizing or vectorizing a compute kernel; deciding if a kernel is compute, memory, latency or cache bound; roofline analysis; AoS to SoA conversion or element batching; removing atomics; loop fusion; sum factorization; algebraic reformulation; GEMM-like register blocking of small matrix assembly; multi-vector batches for ILP; SIMD intrinsics (AVX-512, AVX2, SVE, NEON); forcing FMA; skipping rarely taken branches in vector code; streaming or non-temporal stores combined with cache blocking; contiguous loads instead of gathers on structured meshes; per-kernel completion checklist; checking whether GFLOP/s or GB/s above peak is real; comparing an optimized branch against a baseline.'
 ---
 
 # HPC Kernel Optimization Strategy
@@ -16,17 +16,27 @@ reference implementation runnable so every change can be compared against it.
 | 1 | Classify: compute, memory, latency or cache bound | always (decides the path) | low |
 | 2 | Data layout for vectorization, remove serialization | code does not vectorize, uses strided/indirect access, or serializes on atomics | medium |
 | 3 | Better algorithm: same result, less work or traffic | the kernel does redundant work or makes redundant passes over memory | medium to high |
-| 4 | Intrinsics (FMA, register blocking, transposes), streaming stores | still compute bound after stages 2–3, or a store/gather inefficiency remains | high, ISA-specific |
+| 4 | Intrinsics (FMA, register blocking, transposes, branch skipping), streaming stores, combined traffic reductions | always evaluated; pays off when compute bound, when branches are data dependent, or when stores/re-reads move extra bytes | high, ISA-specific |
 
 Rules of thumb:
 - **Expect the largest wins from stages 2 and 3.** Intrinsics on top of
   code the compiler already vectorizes well usually add a modest gain. They
   matter most for register-heavy dense contractions, where the compiler
-  spills or misses FMA opportunities.
+  spills or misses FMA opportunities, and for data-dependent branches (see
+  4f).
 - **Memory-bound kernels already at DRAM peak gain nothing** from better
-  vectorization. Only moving fewer bytes helps.
+  vectorization. Only moving fewer bytes helps. "At DRAM peak" must be
+  checked with *real* traffic against the *minimum* traffic: compiler
+  if-conversion, write-allocate and re-reads of neighbouring planes all
+  move bytes the algorithm does not need, and stage 4 removes them.
 - **Removing atomics or serialization** can give order-of-magnitude gains
   when it applies, because it restores full parallelism.
+- **Every stage is evaluated for every kernel.** A kernel is finished only
+  when each stage has been either applied or ruled out *by a measurement*,
+  never by these rules of thumb alone. Keep a per-kernel checklist (see
+  "Completion checklist" at the end) and fill it in. Skipping stage 4
+  because a kernel "is memory bound" or "already vectorizes" is the most
+  common way to leave large gains behind.
 
 ---
 
@@ -81,8 +91,12 @@ Classes and what to do next:
 - **Memory bound at DRAM peak:** reduce traffic.
   - Fuse passes.
   - Avoid write-allocate with streaming stores.
+  - Do not load arrays that only a rarely taken branch needs (see 4f).
   - Recompute instead of loading.
   - Use smaller types if allowed.
+  - Combine the traffic reductions that apply (e.g. cache blocking *and*
+    streaming stores) in one tuning; separately they each leave the other
+    half of the excess traffic in place.
 - **Memory bound below peak:** fix the access pattern.
   - Unit stride and SoA layout.
   - Gather instead of scatter.
@@ -174,7 +188,7 @@ usually beats everything else. Patterns that generalize:
 
 | Pattern | Recognize it by | Effect |
 |---|---|---|
-| **Loop fusion** | a chain of element-wise loops over the same index range, communicating through temporary arrays | one pass, temporaries stay in registers, traffic drops by the number of eliminated passes; keeping the operation order can make it bit-exact |
+| **Loop fusion** | a chain of element-wise loops over the same index range, communicating through temporary arrays | one pass, temporaries stay in registers, traffic drops by the number of eliminated passes; keeping the operation order can make it bit-exact. If the loops have data-dependent branches, the compiler-vectorized fused loop still loads every branch's arrays (see 4f) |
 | **Sum factorization** | tensor-product structure, e.g. $\sum_q \prod_d B_{i_d q_d} B_{j_d q_d}\, D_q$ evaluated naively | contract one dimension at a time; work goes from $O(p^{2d} q^d)$ to roughly $O(p^{d+1} q^d)$; the saving grows with order and dimension |
 | **Metric / algebraic reformulation** | every basis function or vector is transformed by the same Jacobian at each quadrature point | transform the *metric* once per point ($G = J^T J/\det J$, $H = \det J\, J^{-1}J^{-T}$) and contract with the untransformed reference basis; exploit its sparsity; each entry becomes a few FMAs |
 | **Share work across outputs** | the same input is processed separately against several neighbouring targets (e.g. clipping one cell against each of its $2^d$ overlapping cells) | split once by the shared planes or boundaries so each piece goes to exactly one target; skip copies when a piece lies entirely on one side |
@@ -249,8 +263,19 @@ structures are set up, and stored in a small table the kernel reads.
 
 ## Stage 4: Intrinsics and streaming stores
 
-Only for kernels that are still compute bound, or memory bound with a clear
-store or gather inefficiency, after stages 2 and 3.
+Run this stage for **every** kernel after stages 2 and 3, including the
+memory-bound ones. For each kernel, check each of 4a–4g below, and either
+apply it as a named tuning and measure it, or note why it does not apply
+(for example: "no data-dependent branch", "output fits in the LLC at all
+sizes we report"). What matters most per class:
+
+| Kernel class | Stage 4 items to try first |
+|---|---|
+| compute bound, dense contractions | 4b, 4c, 4d |
+| element-wise / streaming with data-dependent branches | 4f, then 4e |
+| streaming, write-only output above LLC size | 4e (and 4g if items map to lanes) |
+| stencil or gather over a structured grid | cache blocking from stage 1 *plus* 4e in one tuning |
+| gather/scatter through an index table on a structured mesh | 4h |
 
 ### 4a. Structure
 - **One thin wrapper header** with `vd`, `vload`/`vstore` (plus masked
@@ -372,6 +397,67 @@ Expected behaviour:
 **Never use streaming stores when the output fits in the LLC, or when it is
 re-read soon afterwards.**
 
+- **Combine with cache blocking.** For stencils and gathers over 3D grids,
+  blocking (each thread walks the planes of its own strip or tile, so plane
+  k+1 is still in L2) removes the re-reads; streaming stores remove the
+  write-allocate. Offer the combination as one tuning: a blocked tuning
+  with regular stores and an unblocked one with streaming stores each keep
+  the other half of the excess traffic.
+- **Keep the write streams per thread few and sequential.** If SIMD lanes
+  are independent items (elements), streaming each lane's row directly
+  makes VL interleaved write streams per thread. Stage the batch's output
+  (L1/L2) and stream each item's contiguous block in one go, or make the
+  lanes run *within* one item's output row.
+
+### 4f. Data-dependent branches: skip the work, not just the result
+
+Element-wise kernels often have a branch that is expensive (division,
+square root, extra input arrays) but rarely or never taken for real data.
+Scalar code skips it with a well-predicted jump. **The compiler's
+vectorized code does not:** it if-converts the branch, so masked loads of
+all the branch's arrays and the full-width divide/sqrt run for every
+element. The vectorized loop can then move more bytes than the scalar one.
+
+1. Check which branches the benchmark's data actually takes (count them
+   once on the real inputs) and how many extra arrays each one reads.
+2. Hand-write the vector body: compute the branch condition as a mask, and
+   enter the branch only if the mask is non-empty (`if (m)` compiles to
+   `kortest` + jump on AVX-512). Inside, use zero-masked loads
+   (`maskz_loadu`) so inactive lanes compute harmless values, and merge the
+   results with the mask. Keep everything in registers across fused
+   bodies.
+3. Portable fallback without intrinsics: test the condition for a whole
+   tile (a few hundred elements) and dispatch to a branch-free loop when no
+   element needs the branch. The compiler vectorizes both loops well.
+4. Match the scalar NaN semantics in the compare predicates (`!(x > 0)` is
+   `NGT_UQ`, `x <= 0` is `LE_OQ`).
+5. **Test the branch with a standalone harness.** If the benchmark data
+   never takes it, its checksum cannot catch a bug there: use mixed-sign
+   inputs per vector (all taken, none taken, mixed, tail), make every
+   cutoff and clamp fire, and mutation-test the harness.
+
+### 4g. Run the intrinsics path off the target machine
+
+If the development machine lacks the target ISA, test the intrinsics path
+under an instruction emulator (Intel SDE: `sde64 -spr -- ./exe`) for
+correctness, and measure on the target. Do not ship an intrinsics tuning
+that has only ever run on its fallback path.
+
+### 4h. Structured index tables: contiguous loads instead of gathers
+
+Kernels that gather inputs and scatter outputs through an index table
+(element → dof) often run on a structured mesh, where the table has a
+regular form, e.g. node(d, k) = n0(d) + 2k + d_x for SIMD lane k. Then:
+
+- Load the needed span contiguously and extract the lanes with permutes
+  (even/odd extraction with `permutex2var`) instead of a gather.
+- Accumulate outputs of neighbouring lanes that share a node in registers
+  (lane shift with `valignq` + add) and update contiguous spans with plain
+  loads and stores instead of a scatter.
+- Keep it general: verify in setup that the table has the assumed form,
+  store a flag, and fall back to the gather/scatter path otherwise; still
+  read the base index (n0) from the table rather than recomputing it.
+
 ## Stage 5: Validate and report
 
 1. All correctness checks pass for every variant. Compare checksums across
@@ -387,6 +473,20 @@ re-read soon afterwards.**
      reformulation.
 4. Record lessons (pitfalls, flags, machine facts) in persistent notes for
    the next agent.
+5. If an independent implementation of the same kernel exists (another
+   branch, another team, a library), compare against it at the same sizes.
+   Every kernel where it is faster points to a stage that was skipped.
+
+### Completion checklist (per kernel)
+
+Fill in one line per kernel before calling the work done. Each cell is
+either the tuning that implements the item, with its measured effect, or a
+short reason it does not apply, backed by a measurement or a count.
+
+| Kernel | 1: class, real vs min. bytes | 2: layout / atomics | 3: algorithm | 4b–d: FMA, blocking, ILP | 4e: NT stores (+ blocking) | 4f: branch skip | 4h: structured loads | sizes measured |
+|---|---|---|---|---|---|---|---|---|
+
+A row with an empty cell means the kernel is not finished.
 
 ## Integrating into a benchmark suite
 

@@ -21,7 +21,8 @@ namespace apps {
 
 
 // tune_idx 0: reference algorithm; 1: sum factorization; 2: sum factorization
-// with streaming stores of M
+// with streaming stores of M; 3: 2 with each element's slice of M staged and
+// streamed contiguously
 template <size_t tune_idx>
 void MASS3DEA::runOpenMPVariant(VariantID vid) {
 
@@ -32,7 +33,8 @@ void MASS3DEA::runOpenMPVariant(VariantID vid) {
 
   if constexpr (tune_idx > 0) {
 
-  constexpr bool stream = (tune_idx == 2);
+  constexpr bool stream = (tune_idx == 2 || tune_idx == 3);
+  constexpr bool seq = (tune_idx == 3);
   const bool nt_ok = fem_simd::is_aligned64(M);
   const Index_type nbe = (NE + FEM_VL - 1) / FEM_VL;
 
@@ -49,7 +51,7 @@ void MASS3DEA::runOpenMPVariant(VariantID vid) {
         #pragma omp for collapse(2) nowait
         for (Index_type b = 0; b < nbe; ++b) {
           for (Index_type j3 = 0; j3 < mea::D1D; ++j3) {
-            mass3dea_sumfact_block<stream>(B, D, M, NE, b * FEM_VL, j3, nt_ok);
+            mass3dea_sumfact_block<stream, seq>(B, D, M, NE, b * FEM_VL, j3, nt_ok);
           }
         }
         if (stream) { fem_simd::stream_fence(); }
@@ -72,7 +74,7 @@ void MASS3DEA::runOpenMPVariant(VariantID vid) {
       RAJA::region<RAJA::omp_parallel_region>( [=]() {
         RAJA::forall< RAJA::omp_for_nowait_static_exec< > >( res,
           RAJA::RangeSegment(0, nbe * mea::D1D), [=](Index_type ej) {
-            mass3dea_sumfact_block<stream>(B, D, M, NE, (ej / mea::D1D) * FEM_VL,
+            mass3dea_sumfact_block<stream, seq>(B, D, M, NE, (ej / mea::D1D) * FEM_VL,
                                            ej % mea::D1D, nt_ok);
           });
         if (stream) { fem_simd::stream_fence(); }
@@ -246,6 +248,7 @@ void MASS3DEA::defineOpenMPVariantTunings()
     addVariantTuning<&MASS3DEA::runOpenMPVariant<1>>(vid, "sumfact");
 #if defined(RAJAPERF_FEM_AVX512)
     addVariantTuning<&MASS3DEA::runOpenMPVariant<2>>(vid, "sumfact_nt");
+    addVariantTuning<&MASS3DEA::runOpenMPVariant<3>>(vid, "sumfact_nt_seq");
 #endif
   }
 }

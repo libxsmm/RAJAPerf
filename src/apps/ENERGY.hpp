@@ -250,6 +250,205 @@ constexpr rajaperf::Index_type ENERGY_TILE = 256;
     } \
   }
 
+namespace rajaperf
+{
+namespace apps
+{
+
+struct EnergyArgs
+{
+  Real_ptr e_new, e_old, delvc, p_new, p_old, q_new, q_old, work;
+  Real_ptr compHalfStep, pHalfStep, bvc, pbvc, ql_old, qq_old, vnewc;
+  Real_type rho0, e_cut, emin, q_cut;
+};
+
+#define ENERGY_ARGS_SETUP \
+  const EnergyArgs energy_args{e_new, e_old, delvc, p_new, p_old, q_new, \
+      q_old, work, compHalfStep, pHalfStep, bvc, pbvc, ql_old, qq_old, vnewc, \
+      rho0, e_cut, emin, q_cut};
+
+//
+// Fused ENERGY with the delvc <= 0 work skipped where no element needs it.
+// That branch reads 6 more arrays (compHalfStep, bvc, pbvc, ql_old, qq_old,
+// vnewc) and needs a division and two square roots; compiler if-conversion
+// executes it for every element. Here it runs only for vectors (AVX-512) or
+// tiles (portable path) that contain such an element, so the common case
+// reads 7 arrays instead of 13.
+//
+#if defined(RAJAPERF_FEM_AVX512)
+
+// ssc = (pbvc*e + v*v*bvc*p) / rho0; ssc <= 0.1111111e-36 ? 0.3333333e-18 : sqrt(ssc)
+RAJA_INLINE __m512d energy_ssc_avx512(__m512d pbv, __m512d e, __m512d v,
+                                      __m512d bv, __m512d p, Real_type rho0)
+{
+  const __m512d t = _mm512_mul_pd(_mm512_mul_pd(v, v), _mm512_mul_pd(bv, p));
+  const __m512d s = _mm512_div_pd(_mm512_fmadd_pd(pbv, e, t), _mm512_set1_pd(rho0));
+  const __mmask8 m = _mm512_cmp_pd_mask(s, _mm512_set1_pd(0.1111111e-36), _CMP_NLE_UQ);
+  return _mm512_mask_sqrt_pd(_mm512_set1_pd(0.3333333e-18), m, s);
+}
+
+// |e| < e_cut -> 0, then e < emin -> emin (scalar order)
+RAJA_INLINE __m512d energy_eclamp_avx512(__m512d e, Real_type e_cut, Real_type emin)
+{
+  const __mmask8 mc = _mm512_cmp_pd_mask(_mm512_abs_pd(e), _mm512_set1_pd(e_cut), _CMP_LT_OQ);
+  e = _mm512_mask_mov_pd(e, mc, _mm512_setzero_pd());
+  const __m512d vmin = _mm512_set1_pd(emin);
+  return _mm512_mask_mov_pd(e, _mm512_cmp_pd_mask(e, vmin, _CMP_LT_OQ), vmin);
+}
+
+// ENERGY_BODY1..6 for the lanes in mv of [i, i+8). FULL: mv is all lanes.
+// STREAM: e_new + i and q_new + i are 64B aligned and FULL.
+template < bool FULL, bool STREAM >
+RAJA_INLINE void energy_vec8_avx512(const EnergyArgs& a, Index_type i, __mmask8 mv)
+{
+  auto ld = [&](const Real_type* p) {
+    return FULL ? _mm512_loadu_pd(p + i) : _mm512_maskz_loadu_pd(mv, p + i);
+  };
+  const __m512d zero = _mm512_setzero_pd();
+  const __m512d half = _mm512_set1_pd(0.5);
+
+  const __m512d dv = ld(a.delvc);
+  const __m512d pq = _mm512_add_pd(ld(a.p_old), ld(a.q_old));
+  const __m512d phs = ld(a.pHalfStep);
+  const __m512d hwork = _mm512_mul_pd(half, ld(a.work));
+  const __m512d pnew = ld(a.p_new);
+  const __m512d hdv = _mm512_mul_pd(half, dv);
+
+  // lanes taking the delvc <= 0 branches (bodies 2 and 5: !(dv > 0))
+  const __mmask8 mq = _mm512_cmp_pd_mask(dv, zero, _CMP_NGT_UQ) & mv;
+
+  // body 1
+  __m512d en = _mm512_add_pd(_mm512_fnmadd_pd(hdv, pq, ld(a.e_old)), hwork);
+
+  __m512d qn = zero;
+  __m512d pbv = zero, bv = zero, vn = zero, qlo = zero, qqo = zero;
+  if (mq) {
+    pbv = _mm512_maskz_loadu_pd(mq, a.pbvc + i);
+    bv = _mm512_maskz_loadu_pd(mq, a.bvc + i);
+    vn = _mm512_maskz_loadu_pd(mq, a.vnewc + i);
+    qlo = _mm512_maskz_loadu_pd(mq, a.ql_old + i);
+    qqo = _mm512_maskz_loadu_pd(mq, a.qq_old + i);
+    // body 2
+    const __m512d one = _mm512_set1_pd(1.0);
+    const __m512d vhalf = _mm512_div_pd(one,
+        _mm512_add_pd(one, _mm512_maskz_loadu_pd(mq, a.compHalfStep + i)));
+    const __m512d ssc = energy_ssc_avx512(pbv, en, vhalf, bv, phs, a.rho0);
+    qn = _mm512_maskz_fmadd_pd(mq, ssc, qlo, qqo);
+  }
+
+  // bodies 3, 4
+  const __m512d hq = _mm512_add_pd(phs, qn);
+  en = _mm512_fmadd_pd(hdv,
+         _mm512_fmsub_pd(_mm512_set1_pd(3.0), pq, _mm512_mul_pd(_mm512_set1_pd(4.0), hq)),
+         en);
+  en = energy_eclamp_avx512(_mm512_add_pd(en, hwork), a.e_cut, a.emin);
+
+  // body 5
+  __m512d qt = zero;
+  if (mq) {
+    const __m512d ssc = energy_ssc_avx512(pbv, en, vn, bv, pnew, a.rho0);
+    qt = _mm512_maskz_fmadd_pd(mq, ssc, qlo, qqo);
+  }
+  __m512d t = _mm512_fmsub_pd(_mm512_set1_pd(7.0), pq, _mm512_mul_pd(_mm512_set1_pd(8.0), hq));
+  t = _mm512_add_pd(t, _mm512_add_pd(pnew, qt));
+  en = _mm512_sub_pd(en, _mm512_div_pd(_mm512_mul_pd(t, dv), _mm512_set1_pd(6.0)));
+  en = energy_eclamp_avx512(en, a.e_cut, a.emin);
+
+  // body 6 (dv <= 0)
+  const __mmask8 m6 = _mm512_cmp_pd_mask(dv, zero, _CMP_LE_OQ) & mq;
+  if (m6) {
+    const __m512d ssc = energy_ssc_avx512(pbv, en, vn, bv, pnew, a.rho0);
+    __m512d q6 = _mm512_fmadd_pd(ssc, qlo, qqo);
+    const __mmask8 mc = _mm512_cmp_pd_mask(_mm512_abs_pd(q6), _mm512_set1_pd(a.q_cut), _CMP_LT_OQ);
+    q6 = _mm512_mask_mov_pd(q6, mc, zero);
+    qn = _mm512_mask_mov_pd(qn, m6, q6);
+  }
+
+  if constexpr (STREAM) {
+    _mm512_stream_pd(a.e_new + i, en);
+    _mm512_stream_pd(a.q_new + i, qn);
+  } else if constexpr (FULL) {
+    _mm512_storeu_pd(a.e_new + i, en);
+    _mm512_storeu_pd(a.q_new + i, qn);
+  } else {
+    _mm512_mask_storeu_pd(a.e_new + i, mv, en);
+    _mm512_mask_storeu_pd(a.q_new + i, mv, qn);
+  }
+}
+
+#endif
+
+// Fused, branch-skipping ENERGY over [t, tend). STREAM (AVX-512 only) writes
+// full vectors with non-temporal stores when e_new and q_new are aligned.
+template < bool STREAM >
+RAJA_INLINE void energy_fused_skip_tile(const EnergyArgs& a, Index_type t, Index_type tend)
+{
+#if defined(RAJAPERF_FEM_AVX512)
+  const bool nt = STREAM && fem_simd::is_aligned64(a.e_new + t) &&
+                  fem_simd::is_aligned64(a.q_new + t);
+  Index_type i = t;
+  if (nt) {
+    for (; i + 8 <= tend; i += 8) {
+      energy_vec8_avx512<true, true>(a, i, 0xFF);
+    }
+  } else {
+    for (; i + 8 <= tend; i += 8) {
+      energy_vec8_avx512<true, false>(a, i, 0xFF);
+    }
+  }
+  if (i < tend) {
+    energy_vec8_avx512<false, false>(a, i, fem_simd::lane_mask(tend - i));
+  }
+#else
+  static_assert(!STREAM, "streaming stores need the AVX-512 path");
+  Real_ptr e_new = a.e_new; Real_ptr e_old = a.e_old; Real_ptr delvc = a.delvc;
+  Real_ptr p_new = a.p_new; Real_ptr p_old = a.p_old; Real_ptr q_new = a.q_new;
+  Real_ptr q_old = a.q_old; Real_ptr work = a.work;
+  Real_ptr compHalfStep = a.compHalfStep; Real_ptr pHalfStep = a.pHalfStep;
+  Real_ptr bvc = a.bvc; Real_ptr pbvc = a.pbvc; Real_ptr ql_old = a.ql_old;
+  Real_ptr qq_old = a.qq_old; Real_ptr vnewc = a.vnewc;
+  const Real_type rho0 = a.rho0; const Real_type e_cut = a.e_cut;
+  const Real_type emin = a.emin; const Real_type q_cut = a.q_cut;
+  int any_le = 0;
+  for (Index_type i = t; i < tend; ++i) {
+    any_le |= !(delvc[i] > 0.0);
+  }
+  if (any_le) {
+    FEM_OMP_SIMD
+    for (Index_type i = t; i < tend; ++i) {
+      ENERGY_FUSED_COMPUTE(en, qn);
+      e_new[i] = en;
+      q_new[i] = qn;
+    }
+  } else {
+    // ENERGY_FUSED_COMPUTE with delvc > 0: q_new = q_tilde = 0
+    FEM_OMP_SIMD
+    for (Index_type i = t; i < tend; ++i) {
+      const Real_type dv = delvc[i];
+      const Real_type pq_old = p_old[i] + q_old[i];
+      const Real_type phs = pHalfStep[i];
+      const Real_type hwork = 0.5 * work[i];
+      Real_type en = e_old[i] - 0.5 * dv * pq_old + hwork;
+      en = en + 0.5 * dv * ( 3.0 * pq_old - 4.0 * phs );
+      en += hwork;
+      if ( fabs(en) < e_cut ) { en = 0.0; }
+      if ( en < emin ) { en = emin; }
+      en = en - ( 7.0 * pq_old - 8.0 * phs + p_new[i] ) * dv / 6.0;
+      if ( fabs(en) < e_cut ) { en = 0.0; }
+      if ( en < emin ) { en = emin; }
+      e_new[i] = en;
+      q_new[i] = 0.0;
+    }
+  }
+  RAJA_UNUSED_VAR(compHalfStep); RAJA_UNUSED_VAR(bvc); RAJA_UNUSED_VAR(pbvc);
+  RAJA_UNUSED_VAR(ql_old); RAJA_UNUSED_VAR(qq_old); RAJA_UNUSED_VAR(vnewc);
+  RAJA_UNUSED_VAR(rho0); RAJA_UNUSED_VAR(q_cut);
+#endif
+}
+
+} // end namespace apps
+} // end namespace rajaperf
+
 #include "common/KernelBase.hpp"
 
 namespace rajaperf

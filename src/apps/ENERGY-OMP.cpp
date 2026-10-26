@@ -225,7 +225,8 @@ void ENERGY::runOpenMPVariantReference(VariantID vid)
 }
 
 // tune_idx 0: reference (six loops); 1: fused single pass; 2: fused with
-// streaming (non-temporal) stores of e_new and q_new
+// streaming (non-temporal) stores of e_new and q_new; 3: fused, skipping the
+// delvc <= 0 work per vector (AVX-512) or tile; 4: 3 with streaming stores
 template < size_t tune_idx >
 void ENERGY::runOpenMPVariant(VariantID vid)
 {
@@ -235,17 +236,24 @@ void ENERGY::runOpenMPVariant(VariantID vid)
     runOpenMPVariantReference(vid);
   } else {
 
-  constexpr bool stream = (tune_idx == 2);
+  constexpr bool stream = (tune_idx == 2 || tune_idx == 4);
   const Index_type run_reps = getRunReps();
   const Index_type ibegin = 0;
   const Index_type iend = getActualProblemSize();
 
   ENERGY_DATA_SETUP;
+  ENERGY_ARGS_SETUP;
 
   const bool nt_ok = fem_simd::is_aligned64(e_new) && fem_simd::is_aligned64(q_new);
+  RAJA_UNUSED_VAR(nt_ok);
 
   auto energy_tile_lam = [=](Index_type t) {
-                           ENERGY_FUSED_TILE(t, stream);
+                           if constexpr (tune_idx >= 3) {
+                             energy_fused_skip_tile<stream>(energy_args, t,
+                                 RAJA_MIN(t + ENERGY_TILE, iend));
+                           } else {
+                             ENERGY_FUSED_TILE(t, stream);
+                           }
                          };
 
   switch ( vid ) {
@@ -261,7 +269,12 @@ void ENERGY::runOpenMPVariant(VariantID vid)
           RP_CALI_SUBKERNEL_BEGIN("ENERGY_FUSED");
           #pragma omp for schedule(static) nowait
           for (Index_type t = ibegin; t < iend; t += ENERGY_TILE ) {
-            ENERGY_FUSED_TILE(t, stream);
+            if constexpr (tune_idx >= 3) {
+              energy_fused_skip_tile<stream>(energy_args, t,
+                  RAJA_MIN(t + ENERGY_TILE, iend));
+            } else {
+              ENERGY_FUSED_TILE(t, stream);
+            }
           }
           if (stream) { fem_simd::stream_fence(); }
           RP_CALI_SUBKERNEL_END("ENERGY_FUSED");
@@ -338,6 +351,10 @@ void ENERGY::defineOpenMPVariantTunings()
     addVariantTuning<&ENERGY::runOpenMPVariant<1>>(vid, "fused");
 #if defined(RAJAPERF_FEM_AVX512)
     addVariantTuning<&ENERGY::runOpenMPVariant<2>>(vid, "fused_nt");
+#endif
+    addVariantTuning<&ENERGY::runOpenMPVariant<3>>(vid, "fused_skip");
+#if defined(RAJAPERF_FEM_AVX512)
+    addVariantTuning<&ENERGY::runOpenMPVariant<4>>(vid, "fused_skip_nt");
 #endif
   }
 }

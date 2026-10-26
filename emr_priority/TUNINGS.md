@@ -48,6 +48,8 @@ compiled in.
 | `default` | Unchanged reference code (six separate loops). |
 | `fused` | All six loops fused into one pass per element. Bit-exact against the reference; moves fewer bytes than RAJAPerf counts, so its GB/s is overstated. |
 | `fused_nt` | `fused` with results staged in a 256-entry L1 tile and written with streaming stores. **AVX-512 only.** |
+| `fused_skip` | `fused` with the `delvc <= 0` work skipped where no element needs it. That branch reads 6 more arrays and needs a division and two square roots, and the compiler's if-converted vector loop executes it for every element. The AVX-512 path computes all six bodies in registers, 8 elements at a time, and enters the branch only when the lane mask is non-empty. The portable path checks each 256-element tile and runs a branch-free loop when possible. For the suite's inputs (`delvc > 0` everywhere) it reads 7 arrays instead of 13. The branch is checked against the six scalar bodies in a standalone test with mixed-sign `delvc`. |
+| `fused_skip_nt` | `fused_skip` writing `e_new` and `q_new` from registers with streaming stores. **AVX-512 only.** |
 
 ### FEMSWEEP (Base, RAJA)
 
@@ -79,6 +81,7 @@ that synchronizes through a sense-reversing barrier.
 | `default` | Register-blocked AVX-512 path producing contiguous 64-entry blocks; parallel over (element batch, j-block). |
 | `sumfact` | Full sum factorization of the element matrix (T3 -> T2 -> 64-entry blocks), about 17x fewer FLOPs than the reference. Its GFLOP/s are therefore far above hardware peak. |
 | `sumfact_nt` | `sumfact` with a transpose and streaming stores of the output. **AVX-512 only.** |
+| `sumfact_nt_seq` | `sumfact_nt`, but the batch's (element x j3) slices are staged in a 64 KB buffer, and each element's contiguous 8 KB slice is then streamed in one go: one sequential write stream per thread instead of 8 interleaved ones. **AVX-512 only.** |
 
 ### MASS3DPA_ATOMIC (Base, RAJA)
 
@@ -101,10 +104,10 @@ scattered in two passes (even lanes, then odd lanes).
 
 ### NODAL_ACCUMULATION_3D (Base, Lambda, RAJA)
 
-Only the `default` tuning exists. It replaces the zone scatter with atomics by a node
-gather: each node pulls 0.125 · vol from its up to 8 adjacent zones, parallel over
-(j, k) node rows with a SIMD loop over i. There are no atomics and no write conflicts,
-and the result is bit-exact against Base_Seq.
+| Tuning | Description |
+|---|---|
+| `default` | Replaces the zone scatter with atomics by a node gather: each node pulls 0.125 · vol from its up to 8 adjacent zones, parallel over (j, k) node rows with a SIMD loop over i. There are no atomics and no write conflicts, and the result is bit-exact against Base_Seq. |
+| `blocked` | `default` with cache blocking: work units (about one per thread) are (block of 64 node rows in j) x (slab of k-planes) and walk the planes of a slab in order, so the vol rows of plane k-1 are reused from L2 instead of being read again from memory. |
 
 ### VOL3D (Base, Lambda, RAJA)
 
@@ -113,25 +116,29 @@ and the result is bit-exact against Base_Seq.
 | `default` | Unchanged reference loop (kept as a plain member function so the lambda loop is inlined and vectorized). |
 | `blocked` | Cache blocking: work units are (tile of rows) x (slab of k-planes), walking the planes of a slab innermost, so the k+1 plane rows of x, y, z are reused from L2. |
 | `nt` | Each thread computes one 64-byte-aligned contiguous chunk of vol in 256-entry L1 tiles that are streamed to memory. **AVX-512 only.** |
+| `strip` | Plane strips: thread s owns the same contiguous range of offsets in every k-plane and walks the planes in order, so x, y, z of plane k+1 are still in L2 at the next k. |
+| `strip_nt` | `strip` with vol written by streaming stores from 256-entry L1 tiles (blocking and streaming stores combined). **AVX-512 only.** |
 
 ## Which tuning to pick
 
 Best tuning per problem-size regime on a 64-core Xeon 8592+ (see
-[size_sweep/SIZE_SWEEP.md](size_sweep/SIZE_SWEEP.md)). `fit` is a working set of about
+[size_sweep/SIZE_SWEEP.md](size_sweep/SIZE_SWEEP.md); the `fused_skip*`, `strip*`,
+NODAL `blocked` and `sumfact_nt_seq` tunings were measured later at the same sizes,
+see [compare_other/COMPARISON.md](compare_other/COMPARISON.md)). `fit` is a working set of about
 0.25x LLC; `exceed` is about 8x LLC.
 
 | Kernel | in cache (default / fit) | out of cache (exceed) |
 |---|---|---|
 | EDGE3D | `metric_rb` | `metric_rb` |
 | DIFFUSION3DPA | `default` | `transpose` |
-| ENERGY | `fused` | `fused` / `fused_nt` |
+| ENERGY | `fused_skip` | `fused_skip` / `fused_skip_nt` |
 | FEMSWEEP | `prefetch_mixed_ft` | `prefetch_mixed_ft` |
 | INTSC_HEXRECT | `split_simd` | `split_simd` |
-| MASS3DEA | `sumfact` | `sumfact_nt` |
+| MASS3DEA | `sumfact` | `sumfact_nt_seq` |
 | MASS3DPA_ATOMIC | `pf1` / `default` | `pf1` |
 | MASSVEC3DPA | `default` | `nt_pf1` |
-| NODAL_ACCUMULATION_3D | `default` | `default` |
-| VOL3D | `default` | `blocked` |
+| NODAL_ACCUMULATION_3D | `default` | `blocked` |
+| VOL3D | `default` / `strip` | `strip_nt` |
 
-Streaming-store (`_nt`) and cache-blocking (`blocked`) tunings are slower when the data
+Streaming-store (`_nt`) and cache-blocking (`blocked`, `strip`) tunings are slower when the data
 fits in the LLC and only pay off at the `exceed` size.

@@ -298,8 +298,11 @@ RAJAPERF_FEM_NOINLINE void mass3dea_block_avx512(
 //   b(k,i,j) = B(k,i) B(k,j): O(D^2Q^3 + D^4Q^2 + D^6Q) instead of O(D^6Q^3).
 // Each (j1,j2) block of 64 entries per element is written with streaming
 // stores when STREAM (and AVX-512) is available and M is 64B aligned.
+// SEQ (with STREAM): the batch's j3 slices (VL x 1024 entries) are staged
+// and each element's contiguous 8 KB slice is streamed in one go, so a thread
+// has one sequential write stream instead of VL interleaved ones.
 //
-template <bool STREAM>
+template <bool STREAM, bool SEQ = false>
 RAJAPERF_FEM_NOINLINE void mass3dea_sumfact_block(
     rajaperf::Real_const_ptr B, rajaperf::Real_const_ptr D, rajaperf::Real_ptr M,
     const rajaperf::Index_type NE, const rajaperf::Index_type e0,
@@ -374,6 +377,11 @@ RAJAPERF_FEM_NOINLINE void mass3dea_sumfact_block(
 
   alignas(64) Real_type blk[NI][VL];
   RAJAPERF_FEM_STACK_ALIGN(blk);
+#if defined(RAJAPERF_FEM_AVX512)
+  constexpr bool stage = STREAM && SEQ;
+  alignas(64) Real_type stg[stage ? VL : 1][stage ? NI * D1 * D1 : 1];
+  if constexpr (stage) { RAJAPERF_FEM_STACK_ALIGN(stg); }
+#endif
   for (Index_type j2 = 0; j2 < D1; ++j2) {
     for (Index_type j1 = 0; j1 < D1; ++j1) {
       // blk[i1 + D1*(i2 + D1*i3)] = sum_k1 b(k1,i1,j1) T2[j2][i2][i3][k1]
@@ -400,6 +408,14 @@ RAJAPERF_FEM_NOINLINE void mass3dea_sumfact_block(
           r[k] = _mm512_load_pd(blk[c + k]);
         }
         transpose8(r);
+        if constexpr (stage) {
+          if (nt) {
+            for (Index_type l = 0; l < VL; ++l) {
+              _mm512_store_pd(&stg[l][off + c], r[l]);
+            }
+            continue;
+          }
+        }
         if (nt) {
           for (Index_type l = 0; l < VL; ++l) {
             _mm512_stream_pd(row[l] + off + c, r[l]);
@@ -420,6 +436,15 @@ RAJAPERF_FEM_NOINLINE void mass3dea_sumfact_block(
 #endif
     }
   }
+#if defined(RAJAPERF_FEM_AVX512)
+  if constexpr (stage) {
+    if (nt_ok && nel == VL) {
+      for (Index_type l = 0; l < VL; ++l) {
+        rajaperf::fem_simd::stream_copy(row[l], stg[l], NI * D1 * D1);
+      }
+    }
+  }
+#endif
 }
 
 namespace rajaperf {

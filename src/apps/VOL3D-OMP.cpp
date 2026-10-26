@@ -130,6 +130,10 @@ struct Vol3dTile
 // planes of a slab innermost, so the k+1 plane rows of x, y, z are reused
 // from L2 instead of being read again from memory. Every index in
 // [ibegin, iend) is computed exactly once with VOL3D_BODY.
+// tune_idx 3: plane strips. Thread s owns the offsets [s*chunk, (s+1)*chunk)
+// of every k-plane and walks the planes in order, so x, y, z of plane k+1 are
+// still in L2 when it computes plane k+1 (one long contiguous run per plane).
+// tune_idx 4: tune_idx 3 with vol written by streaming stores as in 1.
 //
 template < size_t tune_idx >
 void VOL3D::runOpenMPVariantTuned(VariantID vid)
@@ -221,7 +225,112 @@ void VOL3D::runOpenMPVariantTuned(VariantID vid)
     return;
   }
 
-  static_assert(tune_idx == 1 || tune_idx == 2, "unknown VOL3D tuning");
+  if constexpr (tune_idx == 3 || tune_idx == 4) {
+
+    constexpr bool stream = (tune_idx == 4);
+    constexpr Index_type TILE = 256;
+    const Index_type kp = m_domain->kp;
+    const Index_type kfirst = ibegin / kp;
+    const Index_type klast = (iend - 1) / kp;
+    const Index_type nstrips = omp_get_max_threads();
+    const Index_type chunk = 8 * (((kp + nstrips - 1) / nstrips + 7) / 8);
+
+    // [lo, hi) with full aligned 64B lines of vol streamed from an L1 tile
+    auto vol3d_range_nt = [=](Index_type lo, Index_type hi) {
+      const Index_type a = RAJA_MIN(hi, lo + static_cast<Index_type>(
+          ((64 - (reinterpret_cast<std::uintptr_t>(vol + lo) & 63)) & 63) /
+          sizeof(Real_type)));
+      for (Index_type i = lo; i < a; ++i) {
+        VOL3D_BODY;
+      }
+      alignas(64) Real_type buf[TILE];
+      for (Index_type t0 = a; t0 < hi; t0 += TILE) {
+        const Index_type n = RAJA_MIN(TILE, hi - t0);
+        {
+          const Vol3dTile vol{buf, t0};
+          for (Index_type i = t0; i < t0 + n; ++i) {
+            VOL3D_BODY;
+          }
+        }
+        const Index_type n8 = n & ~Index_type(7);
+        fem_simd::stream_copy(vol + t0, buf, n8);
+        for (Index_type k = n8; k < n; ++k) {
+          vol[t0 + k] = buf[k];
+        }
+      }
+    };
+
+    // strip s: offsets [s*chunk, (s+1)*chunk) of every k-plane, planes in
+    // order, so the k+1 plane of x, y, z is reused from L2 at the next k
+    auto vol3d_strip = [=](Index_type s) {
+      const Index_type lo = s * chunk;
+      const Index_type hi = RAJA_MIN(lo + chunk, kp);
+      for (Index_type k = kfirst; k <= klast && lo < hi; ++k) {
+        const Index_type sb = RAJA_MAX(k * kp + lo, ibegin);
+        const Index_type se = RAJA_MIN(k * kp + hi, iend);
+        if (sb >= se) { continue; }
+        if constexpr (stream) {
+          vol3d_range_nt(sb, se);
+        } else {
+          for (Index_type i = sb; i < se; ++i) {
+            VOL3D_BODY;
+          }
+        }
+      }
+      if constexpr (stream) { fem_simd::stream_fence(); }
+    };
+    RAJA_UNUSED_VAR(vol3d_range_nt);
+
+    switch ( vid ) {
+
+      case Base_OpenMP :
+      case Lambda_OpenMP : {
+
+        startTimer();
+        // Loop counter increment uses macro to quiet C++20 compiler warning
+        for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
+
+          RP_CALI_SUBKERNEL_BEGIN("VOL3D_1");
+          #pragma omp parallel for schedule(static, 1)
+          for (Index_type s = 0; s < nstrips; ++s) {
+            vol3d_strip(s);
+          }
+          RP_CALI_SUBKERNEL_END("VOL3D_1");
+
+        }
+        stopTimer();
+
+        break;
+      }
+
+      case RAJA_OpenMP : {
+
+        auto res{getHostResource()};
+
+        startTimer();
+        // Loop counter increment uses macro to quiet C++20 compiler warning
+        for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
+
+          RP_CALI_SUBKERNEL_BEGIN("VOL3D_1");
+          RAJA::forall<RAJA::omp_parallel_for_static_exec<1>>( res,
+            RAJA::RangeSegment(0, nstrips), vol3d_strip);
+          RP_CALI_SUBKERNEL_END("VOL3D_1");
+
+        }
+        stopTimer();
+
+        break;
+      }
+
+      default : {
+        getCout() << "\n  VOL3D : Unknown variant id = " << vid << std::endl;
+      }
+
+    }
+    return;
+  }
+
+  static_assert(tune_idx >= 1 && tune_idx <= 4, "unknown VOL3D tuning");
   if constexpr (tune_idx == 1) {
 
     constexpr Index_type TILE = 256;
@@ -318,8 +427,10 @@ void VOL3D::defineOpenMPVariantTunings()
   for (VariantID vid : {Base_OpenMP, Lambda_OpenMP, RAJA_OpenMP}) {
     addVariantTuning<&VOL3D::runOpenMPVariant>(vid, getDefaultTuningName());
     addVariantTuning<&VOL3D::runOpenMPVariantTuned<2>>(vid, "blocked");
+    addVariantTuning<&VOL3D::runOpenMPVariantTuned<3>>(vid, "strip");
 #if defined(RAJAPERF_FEM_AVX512)
     addVariantTuning<&VOL3D::runOpenMPVariantTuned<1>>(vid, "nt");
+    addVariantTuning<&VOL3D::runOpenMPVariantTuned<4>>(vid, "strip_nt");
 #endif
   }
 }

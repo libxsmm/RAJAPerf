@@ -137,6 +137,7 @@ public:
 
   void runSeqVariant(VariantID vid);
   void runOpenMPVariant(VariantID vid);
+  void runOpenMPVariantBlocked(VariantID vid);
   void runOpenMPTargetVariant(VariantID vid);
   void runKokkosVariant(VariantID vid);
 

@@ -99,3 +99,35 @@ GFLOP/s: [SIZE_SWEEP.md](SIZE_SWEEP.md).
 - `sizes*.csv/txt`, `<regime>/{build,node}-info.txt`, `sweep-392590.log`: inputs and
   provenance. The remote work directory is
   `/data/nfs_home/aheineck/Projects/RAJA_workspace/emr_cmp_other`.
+
+## Follow-up: closing findings 3 and 4
+
+New tunings (see [../TUNINGS.md](../TUNINGS.md)), measured on the same node type,
+compiler, flags and sizes. Both binaries ran interleaved, 3 runs x 3 passes, in Slurm
+job 392909. Remote directory: `/data/nfs_home/aheineck/Projects/RAJA_workspace/emr_vec2`.
+All checksums pass. Ratio = other's fastest variant / ours (>1 = ours faster):
+
+| Kernel | Tuning | default | fit | exceed | Before (exceed) |
+|---|---|---:|---:|---:|---:|
+| ENERGY | `fused_skip` | 1.55x | 1.23x | 1.19x | 0.67x (`fused`) |
+| ENERGY | `fused_skip_nt` | 0.50x | 0.55x | 1.20x | |
+| VOL3D | `strip` | 1.23x | 1.20x | 0.94x | |
+| VOL3D | `strip_nt` | 0.99x | 0.96x | 1.00x | 0.87x (`blocked`) |
+| NODAL_ACCUMULATION_3D | `blocked` | 1.10x | 0.73x | 1.03x | 0.78x (`default`) |
+| MASS3DEA | `sumfact_nt_seq` | 1.07x | 1.00x | 1.01x | 0.86x (`sumfact_nt`) |
+
+- **ENERGY:** the other tree's lead did not come from streaming stores (its ENERGY has
+  none). It came from hand-written AVX-512 that tests the rarely taken `delvc <= 0`
+  branch for a whole vector. The suite's inputs never take that branch, so the 6 arrays,
+  the division and the square roots it needs are skipped; our compiler-vectorized
+  `fused` if-converted the branch and paid for all of it on every element. `fused_skip`
+  reads 7 arrays instead of 13. It is now faster than the other tree in every regime.
+- **VOL3D:** the other tree combines plane strips with streaming stores. We had blocking
+  (`blocked`) and streaming stores (`nt`) only as separate tunings; `strip_nt` combines
+  them.
+- **NODAL_ACCUMULATION_3D:** cache blocking of our gather (64-row j blocks x k slabs,
+  about one unit per thread) keeps plane k-1 in L2. With 16-row blocks the halo row
+  re-reads left it 4% behind (0.96x).
+- **MASS3DEA:** our `sumfact_nt` streamed 8 interleaved element rows per thread (lane =
+  element). Staging the batch and streaming each element's 8 KB slice contiguously
+  reaches the other tree's pure streaming-write rate.
