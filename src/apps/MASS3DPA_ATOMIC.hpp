@@ -366,6 +366,13 @@ constexpr RAJA::Index_type MPAT_ROW_BLOCK = 4;
   const Index_type ey_end = RAJA_MIN((by + 1) * MPAT_ROW_BLOCK, Ny);           \
   const Index_type ez_end = RAJA_MIN((bz + 1) * MPAT_ROW_BLOCK, Nz);
 
+// r-th x-row (ey, ez) of row color c = (ey%2) + 2*(ez%2) ("row" tuning);
+// rows of one color share no dofs. nyc = number of rows of color c per z-plane.
+#define MPAT_COLOR_ROW(c, r)                                                   \
+  const Index_type nyc = (Ny - ((c) & 1) + 1) / 2;                             \
+  const Index_type ey = 2 * ((r) % nyc) + ((c) & 1);                           \
+  const Index_type ez = 2 * ((r) / nyc) + ((c) >> 1);
+
 #if defined(RAJAPERF_FEM_AVX512)
 //
 // AVX-512 batch of consecutive elements [e0, eend) (at most FEM_VL) of one
@@ -449,6 +456,113 @@ RAJAPERF_FEM_NOINLINE void mass3dpa_atomic_batch_avx512(
     _mm512_mask_i64scatter_pd(Y, lm, dof[j], vadd(yo, y[j]), 8);
   }
 }
+
+//
+// "row" tuning: 8 consecutive elements e0..e0+7 of one x-row, lane k =
+// element e0+k, on a mesh with the structured row form checked in setUp
+// (mass3dpa_atomic_row_structured): node (dx,dy,dz) of element e0+k is
+// n0(dy,dz) + 2k + dx with n0(dy,dz) = ElemToDoF of element e0 at (0,dy,dz).
+// Each (dy,dz) node row of the block is then 17 contiguous dofs: X is loaded
+// and Y updated with plain vector loads/stores (load_seg3_x8/add_seg3_x8),
+// the dof shared by lanes k and k+1 being summed in register. The last node
+// of a block is the first one of the next block of the row, so the blocks of
+// a row must run in order on one thread.
+// PF % 100 > 0: D of the block PF blocks ahead and its ElemToDoF entries are
+// prefetched (needs NE). PF >= 100: X and Y node rows of the next block are
+// prefetched.
+//
+template <int PF = 0>
+RAJAPERF_FEM_NOINLINE void mass3dpa_atomic_row8_avx512(
+    rajaperf::Real_const_ptr B, rajaperf::Real_const_ptr D,
+    rajaperf::Real_const_ptr X, rajaperf::Real_ptr Y,
+    const rajaperf::Index_type *ElemToDoF, const rajaperf::Index_type e0,
+    const rajaperf::Index_type NE = 0)
+{
+  using namespace rajaperf::fem_simd;
+  using rajaperf::Real_type;
+  using rajaperf::Index_type;
+  constexpr Index_type D1 = mpa_at::D1D;
+  constexpr Index_type Q1 = mpa_at::Q1D;
+  constexpr Index_type ND = D1 * D1 * D1;
+
+  constexpr int PFD = PF % 100;
+  if constexpr (PFD > 0) {
+    const Index_type ep = e0 + PFD * FEM_VL;
+    if (ep + FEM_VL <= NE) {
+      prefetch_range(&MPAT_D(0, 0, 0, ep), Q1 * Q1 * Q1 * FEM_VL * sizeof(Real_type));
+      prefetch_range(ElemToDoF + ND * ep, ND * sizeof(Index_type));
+    }
+  } else {
+    RAJA_UNUSED_VAR(NE);
+  }
+
+  Real_type b[Q1][D1];
+  for (Index_type d = 0; d < D1; ++d) {
+    for (Index_type q = 0; q < Q1; ++q) {
+      b[q][d] = MPAT_B(q, d);
+    }
+  }
+
+  alignas(64) vd dv[Q1 * Q1 * Q1];
+  RAJAPERF_FEM_STACK_ALIGN(dv);
+  {
+    const Real_type *drow[8];
+    for (Index_type l = 0; l < 8; ++l) {
+      const Index_type e = e0 + l;
+      drow[l] = &MPAT_D(0, 0, 0, e);
+    }
+    load_transpose<Q1 * Q1 * Q1>(drow, dv);
+  }
+
+  const Index_type *e2d = ElemToDoF + ND * e0;
+  Index_type n0[D1 * D1];
+  alignas(64) vd x[ND];
+  alignas(64) vd y[ND];
+  RAJAPERF_FEM_UNROLL
+  for (Index_type r = 0; r < D1 * D1; ++r) {
+    n0[r] = e2d[D1 * r];
+    if constexpr (PF >= 100) {
+      // node rows of the next block of this row: n0 + 16 .. n0 + 32
+      __builtin_prefetch(X + n0[r] + 2 * FEM_VL + 8, 0, 3);
+      __builtin_prefetch(X + n0[r] + 2 * FEM_VL + 16, 0, 3);
+      __builtin_prefetch(Y + n0[r] + 2 * FEM_VL + 8, 1, 3);
+      __builtin_prefetch(Y + n0[r] + 2 * FEM_VL + 16, 1, 3);
+    }
+    vd v[3];
+    load_seg3_x8(X + n0[r], v);
+    RAJAPERF_FEM_UNROLL
+    for (Index_type dx = 0; dx < D1; ++dx) {
+      x[dx + D1 * r] = v[dx];
+    }
+  }
+
+  mass_pa_apply<D1, Q1>(b, x, dv, y);
+
+  RAJAPERF_FEM_UNROLL
+  for (Index_type r = 0; r < D1 * D1; ++r) {
+    const vd v[3] = {y[D1 * r], y[D1 * r + 1], y[D1 * r + 2]};
+    add_seg3_x8(Y + n0[r], v);
+  }
+}
+
+// One whole x-row [rbeg, rbeg + Nx) for the "row" tuning: full blocks of 8
+// with mass3dpa_atomic_row8_avx512, the Nx % 8 tail with the gather batch.
+template <int PF = 0>
+RAJA_INLINE void mass3dpa_atomic_row_avx512(
+    rajaperf::Real_const_ptr B, rajaperf::Real_const_ptr D,
+    rajaperf::Real_const_ptr X, rajaperf::Real_ptr Y,
+    const rajaperf::Index_type *ElemToDoF, const rajaperf::Index_type rbeg,
+    const rajaperf::Index_type Nx, const rajaperf::Index_type NE)
+{
+  const rajaperf::Index_type rend = rbeg + Nx;
+  rajaperf::Index_type e0 = rbeg;
+  for (; e0 + FEM_VL <= rend; e0 += FEM_VL) {
+    mass3dpa_atomic_row8_avx512<PF>(B, D, X, Y, ElemToDoF, e0, NE);
+  }
+  if (e0 < rend) {
+    mass3dpa_atomic_batch_avx512<0>(B, D, X, Y, ElemToDoF, e0, rend, NE);
+  }
+}
 #endif
 
 namespace rajaperf {
@@ -466,6 +580,9 @@ public:
   void setUp(VariantID vid, size_t tune_idx);
   void updateChecksum(VariantID vid, size_t tune_idx);
   void tearDown(VariantID vid, size_t tune_idx);
+
+  static bool rowStructured(Index_type Nx, Index_type Ny, Index_type Nz,
+                            Index_type ndofs, const Index_type *elemToDof);
 
   void defineSeqVariantTunings();
   void defineOpenMPVariantTunings();
@@ -500,6 +617,10 @@ private:
   Index_ptr m_ElemToDoF;
 
   Index_type m_NE;
+
+  // ElemToDoF has the structured row form required by the "row" tuning
+  // (set in setUp); otherwise that tuning runs the default path.
+  bool m_row_structured = false;
 };
 
 } // end namespace apps

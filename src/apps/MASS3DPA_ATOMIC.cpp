@@ -112,6 +112,46 @@ void MASS3DPA_ATOMIC::setUp(VariantID vid,
   auto a_elemToDoF = allocDataForInit(m_ElemToDoF, ndof_per_elem*m_NE, vid);
 
   buildElemToDofTable(m_Nx, m_Ny, m_Nz, m_P, m_ElemToDoF);
+
+  m_row_structured =
+      (vid == Base_OpenMP || vid == RAJA_OpenMP) &&
+      rowStructured(m_Nx, m_Ny, m_Nz, m_Tot_Dofs, m_ElemToDoF);
+}
+
+/**
+ * True if every full block of FEM_VL consecutive elements e0 + k of an x-row
+ * has the form used by the "row" OpenMP tuning: local node (dx,dy,dz) of
+ * element e0 + k is n0(dy,dz) + 2k + dx with n0(dy,dz) = ElemToDoF of e0 at
+ * (0,dy,dz), and all 2*FEM_VL + 1 dofs of a node row are valid indices.
+ */
+bool MASS3DPA_ATOMIC::rowStructured(Index_type Nx, Index_type Ny,
+                                    Index_type Nz, Index_type ndofs,
+                                    const Index_type *elemToDof)
+{
+  constexpr Index_type D1 = mpa_at::D1D;
+  constexpr Index_type ND = D1 * D1 * D1;
+  constexpr Index_type VL = FEM_VL;
+  if (D1 != 3) {
+    return false;
+  }
+  for (Index_type row = 0; row < Ny * Nz; ++row) {
+    for (Index_type e0 = Nx * row; e0 + VL <= Nx * (row + 1); e0 += VL) {
+      for (Index_type r = 0; r < D1 * D1; ++r) {
+        const Index_type n0 = elemToDof[ND * e0 + D1 * r];
+        if (n0 < 0 || n0 + 2 * VL >= ndofs) {
+          return false;
+        }
+        for (Index_type k = 0; k < VL; ++k) {
+          for (Index_type dx = 0; dx < D1; ++dx) {
+            if (elemToDof[ND * (e0 + k) + D1 * r + dx] != n0 + 2 * k + dx) {
+              return false;
+            }
+          }
+        }
+      }
+    }
+  }
+  return true;
 }
 
 void MASS3DPA_ATOMIC::updateChecksum(VariantID vid,
